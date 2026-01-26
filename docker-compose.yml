@@ -1,0 +1,32 @@
+version: "3.8"
+# WOPR Module: Authentik
+# Replaces: Okta, Auth0
+# SSO Type: none
+
+services:
+  authentik:
+    image: ghcr.io/goauthentik/server:2025.8
+    container_name: wopr-authentik
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      - TZ=${TZ:-UTC}
+    volumes:
+      - authentik_data:/data
+    labels:
+      - "wopr.module=authentik"
+      - "wopr.sso=none"
+    networks:
+      - wopr
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
+volumes:
+  authentik_data:
+
+networks:
+  wopr:
+    external: true

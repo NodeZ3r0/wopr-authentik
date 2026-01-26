@@ -1,0 +1,4 @@
+# Caddy config for Authentik
+auth.{$DOMAIN} {
+    reverse_proxy authentik:9000
+}
