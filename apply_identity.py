@@ -13,6 +13,10 @@ Modes
 
 Phases, in run order. Each is idempotent (a second run plans nothing) and reversible.
   trust          D0  one account per email; new sign-ups verify their email
+  antibot  WOPR-059  sign-up abuse defense: throwaway-email block, 3 sign-ups per client IP
+                     per 24h, reputation gate on the login flows (only once auth.wopr.systems
+                     pins X-Forwarded-For), Turnstile captcha on sign-up (only when its keys
+                     are in Infisical and LoveJoos sends its relay proof)
   groups         D8  wopr-verified + yourspace-members, delete 'WOPR Admins-dup2',
                      LoveJoos service account + least-privilege API token (root-only file)
   yourspace-app  D7  public OAuth2 client 'yourspace' (PKCE S256 enforced) for beacon sign-in
@@ -25,6 +29,8 @@ Examples
   ./apply_identity.py                                   # dry-run, all phases
   ./apply_identity.py --phase groups                    # dry-run, one phase
   ./apply_identity.py --apply trust
+  ./apply_identity.py --dry-run --phase antibot
+  ./apply_identity.py --apply antibot --lovejoos-relay-ready   # also the captcha, if keys
   ./apply_identity.py --apply lovejoos-gate --lovejoos-release-deployed \\
       --lovejoos-emails lj-central-users.txt
   ./apply_identity.py --rollback state/20261005T120000.000000Z-trust.json --dry-run
@@ -35,15 +41,17 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SUPPORTED_AUTHENTIK = "2025.12."
 
 API_DEFAULT = "http://127.0.0.1:9091/api/v3"
@@ -51,9 +59,10 @@ ENV_FILE_DEFAULT = "/opt/wopr/control-plane/.env"
 TOKEN_ENV_KEY = "AUTHENTIK_API_TOKEN"
 STATE_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 
-PHASES = ("trust", "groups", "yourspace-app", "bink", "lovejoos-gate")
+PHASES = ("trust", "antibot", "groups", "yourspace-app", "bink", "lovejoos-gate")
 PHASE_TITLES = {
     "trust": "D0 - one account per email, verified sign-ups",
+    "antibot": "WOPR-059 - sign-up abuse defense (throwaway email, per-IP cap, reputation, captcha)",
     "groups": "D8 - wopr-verified, yourspace-members, superuser cleanup, LoveJoos service account",
     "yourspace-app": "D7 - central OAuth2 client 'yourspace' for beacon sign-in",
     "bink": "BINK - pk 23 becomes bink / BINK, YourSpace member, verified (paid)",
@@ -153,6 +162,181 @@ SIGNUP_CLOSED_EXPR = '''\
 # wopr-signup-closed (WOPR-055 / D0, --signup close) - managed by fixwave/authentik/apply_identity.py
 ak_message("Sign-up is closed. A WOPR account is created when you order a service.")
 return False
+'''
+
+# --- antibot (WOPR-059) -----------------------------------------------------
+# The disposable-email list is vendored byte for byte (the same file in every WOPR app,
+# contract ABUSE-DEFENSE) and embedded in the policy. authentik keeps policies in its
+# database, so the list travels with it (backups, restores, rollback of this script) and
+# needs no file mounted into the authentik containers.
+ABUSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "abuse")
+DISPOSABLE_FILE = os.path.join(ABUSE_DIR, "disposable_domains.txt")
+DISPOSABLE_COMMIT_FILE = os.path.join(ABUSE_DIR, "SOURCE_COMMIT")
+DISPOSABLE_SHA256 = "a1390dd93de132a45d6ffd598375310531da5358805659df4113f0584f663ef4"
+DISPOSABLE_COMMIT = "1aac72a07cd89792016dd5d2056bc418d85b8f14"
+DISPOSABLE_DOMAIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+POLICY_DISPOSABLE = "wopr-disposable-email"
+POLICY_SIGNUP_IP = "wopr-signup-ip-limit"
+POLICY_RELAY = "wopr-signup-relay"
+POLICY_REPUTATION = "wopr-reputation"
+POLICY_REPUTATION_GATE = "wopr-reputation-gate"
+SIGNUP_PROMPT = "self-registration-prompt"
+SIGNUP_IP_LIMIT = 3
+SIGNUP_IP_WINDOW_HOURS = 24
+RELAY_HEADER = "X-WOPR-Signup-Relay"
+# authentik's built-in reputation: -1 per failed login or unknown username, +1 per
+# successful login, kept per (username, client IP), clamped to the tenant limits (-5..5)
+# and expiring after reputation.expiry (a day). check_username stays off: anyone who
+# knows a username could otherwise lock its owner out.
+REPUTATION_ATTRS = {"check_ip": True, "check_username": False, "threshold": -5}
+PASSWORD_COMPONENT = "ak-stage-password-form"
+CAPTCHA_STAGE = "wopr-turnstile"
+TURNSTILE_KEYS = ("TURNSTILE_SITE_KEY", "TURNSTILE_SECRET_KEY")
+# error_on_invalid_score must be True: authentik 2025.12 only checks the provider's
+# "success" flag when it is (stages/captcha/stage.py, verify_captcha_token).
+TURNSTILE_ATTRS = {"js_url": "https://challenges.cloudflare.com/turnstile/v0/api.js",
+                   "api_url": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                   "interactive": True, "error_on_invalid_score": True}
+CADDY_SITE_DEFAULT = "/etc/caddy-rig/sites-enabled/auth.wopr.systems.caddy"
+CADDY_XFF_PIN = re.compile(r"header_up\s+X-Forwarded-For\s+(\{client_ip\}|"
+                           r"\{http\.request\.header\.CF-Connecting-IP\})", re.I)
+INFISICAL_ENV_DEFAULT = "/opt/grc/.infisical"
+XFF_FIX = ("add 'header_up X-Forwarded-For {client_ip}' to every reverse_proxy block of that "
+           "site and reload the wopr-caddy-rig container")
+
+DISPOSABLE_EXPR_TEMPLATE = '''\
+# wopr-disposable-email (WOPR-059) - managed by fixwave/authentik/apply_identity.py
+# Validation policy on every prompt stage that writes "email", next to wopr-email-guard.
+# Refuses a NEW address whose domain, or any parent domain, is a throwaway-inbox domain.
+# The list below is the disposable-email-domains project's, commit @COMMIT@
+# (@COUNT@ domains, sha256 @SHA256@),
+# the same vendored file every WOPR app uses (fixwave/authentik/abuse/disposable_domains.txt).
+# An address the signed-in user already has is never refused here, so nobody is locked
+# out of the onboarding or settings form over an old address.
+# The list lives inside this policy because authentik keeps policies in its database: no
+# file in the authentik containers is needed. The check itself is after the list.
+prompt_data = request.context.get("prompt_data") or {}
+email = str(prompt_data.get("email") or "").strip().lower()
+if "@" not in email:
+    return True
+user = request.user
+if getattr(user, "is_authenticated", False):
+    if str(getattr(user, "email", "") or "").strip().lower() == email:
+        return True
+domain = email.rsplit("@", 1)[1].strip().rstrip(".")
+try:
+    domain = domain.encode("idna").decode("ascii")
+except UnicodeError:
+    pass
+DOMAINS = """
+@DOMAINS@"""
+blocked = frozenset(DOMAINS.split())
+labels = [x for x in domain.split(".") if x]
+if any(".".join(labels[i:]) in blocked for i in range(len(labels))):
+    ak_message("Please use a permanent email address; throwaway inboxes can't be used here.")
+    return False
+return True
+'''
+
+RELAY_EXPR = '''\
+# wopr-signup-relay (WOPR-059) - managed by fixwave/authentik/apply_identity.py
+# True only when the request carries LoveJoos's relay proof: header X-WOPR-Signup-Relay
+# equal to the key of API token 'lovejoos-api' of service account 'lovejoos-service'
+# (account active, token not expired). LoveJoos's server sends it when it drives the
+# self-registration flow for a person, straight to authentik on the docker network, never
+# through the public URL. A browser cannot know the key, so it cannot claim what the proof
+# unlocks: no captcha (LoveJoos runs its own proof-of-work) and no central per-IP cap
+# (LoveJoos applies the same 3 sign-ups per IP per 24h itself).
+# Used by wopr-signup-ip-limit (ak_call_policy) and, negated, on the captcha stage.
+from hmac import compare_digest
+from authentik.core.models import Token, TokenIntents
+
+http = getattr(request, "http_request", None)
+sent = str(http.headers.get("X-WOPR-Signup-Relay") or "").strip() if http is not None else ""
+if not sent:
+    return False
+token = (Token.filter_not_expired(identifier="lovejoos-api", intent=TokenIntents.INTENT_API)
+         .select_related("user").first())
+if token is None:
+    return False
+owner = token.user
+if owner.username != "lovejoos-service" or not owner.is_active:
+    return False
+return compare_digest(str(token.key).encode(), sent.encode())
+'''
+
+SIGNUP_IP_EXPR = '''\
+# wopr-signup-ip-limit (WOPR-059) - managed by fixwave/authentik/apply_identity.py
+# Validation policy on the self-registration prompt: at most 3 new accounts per client IP
+# (IPv6: per /64 network) in any 24 hours, counted from authentik's own records: the event
+# user_write with created=true, which authentik writes with the request's client IP each
+# time a flow creates an account. Checked when the form is submitted, right before the
+# account is written (a check when the flow starts could be passed by opening many
+# sign-up pages first). The client IP is ak_client_ip, the first X-Forwarded-For entry,
+# so auth.wopr.systems must pin that header to the real client
+# (Caddy: header_up X-Forwarded-For {client_ip}). Not capped:
+#  - a request with LoveJoos's relay proof (policy wopr-signup-relay): LoveJoos applies the
+#    same rule itself and forwards the person's IP, so those sign-ups still count here
+#    against that IP;
+#  - a client IP that is not a public address: callers inside the Rig (a server driving
+#    this flow without forwarding an IP must not use up everyone's allowance).
+from datetime import timedelta
+from ipaddress import ip_address, ip_network
+from django.utils.timezone import now
+from authentik.events.models import Event, EventAction
+
+LIMIT = 3
+WINDOW = timedelta(hours=24)
+
+def network_of(addr):
+    addr = getattr(addr, "ipv4_mapped", None) or addr
+    return ip_network(f"{addr}/{64 if addr.version == 6 else 32}", strict=False)
+
+client = getattr(ak_client_ip, "ipv4_mapped", None) or ak_client_ip
+if not client.is_global:
+    return True
+if ak_call_policy("wopr-signup-relay").passing:
+    return True
+mine = network_of(client)
+made = 0
+for raw in (Event.objects.filter(action=EventAction.USER_WRITE, context__created=True,
+                                 created__gte=now() - WINDOW)
+            .exclude(client_ip=None).values_list("client_ip", flat=True)):
+    try:
+        if network_of(ip_address(raw)) == mine:
+            made += 1
+    except ValueError:
+        continue
+if made >= LIMIT:
+    ak_message("Too many new accounts were made from your network in the last 24 hours. "
+               "Please try again tomorrow.")
+    return False
+return True
+'''
+
+REPUTATION_GATE_EXPR = '''\
+# wopr-reputation-gate (WOPR-059) - managed by fixwave/authentik/apply_identity.py
+# Bound to every central login flow with a password stage (checked when the flow starts;
+# after 5 wrong passwords the password stage ends the flow, so a guesser has to start
+# again and meets this check) and to the self-registration prompt. Refuses a client IP
+# with a bad reputation according to authentik's built-in reputation policy
+# 'wopr-reputation': -1 per failed login or unknown username from that IP, +1 per
+# successful login; bad = a total of -5 or lower; scores expire after a day. Someone
+# refused can still reset their password (that flow is not gated), which signs them in
+# and lifts the score.
+# Not checked: client IPs that are not public addresses, i.e. callers inside the Rig
+# (LoveJoos's /login drives the login flow from its server without forwarding the
+# person's IP; one person's typos there must not lock every LoveJoos member out). That is
+# only safe while auth.wopr.systems pins X-Forwarded-For to the real client, which
+# apply_identity.py checks before it binds this policy.
+client = getattr(ak_client_ip, "ipv4_mapped", None) or ak_client_ip
+if not client.is_global:
+    return True
+if ak_call_policy("wopr-reputation").passing:
+    ak_message("Too many failed sign-ins came from your network. Reset your password to get "
+               "back in, or try again tomorrow.")
+    return False
+return True
 '''
 
 # --- groups (D8) ------------------------------------------------------------
@@ -283,6 +467,26 @@ def external_ref(kind: str, name: str, phase: str) -> Ref:
     return Ref(f"external:{kind}:{name}", f"{kind} {name} (created by phase {phase})")
 
 
+class InfisicalRef:
+    """A secret read from Infisical only at the moment a change is applied. It is printed
+    and logged as a placeholder, never as its value."""
+
+    __slots__ = ("key", "source")
+
+    def __init__(self, key: str, source):
+        self.key = key
+        self.source = source
+
+    def __repr__(self) -> str:
+        return f"<{self.key} from Infisical, not shown>"
+
+    def __eq__(self, other):
+        return isinstance(other, InfisicalRef) and other.key == self.key
+
+    def __hash__(self):
+        return hash(("InfisicalRef", self.key))
+
+
 def walk_refs(obj):
     if isinstance(obj, Ref):
         yield obj
@@ -298,24 +502,28 @@ class MissingRef(Exception):
     pass
 
 
-def resolve(obj, refs: dict):
+def resolve(obj, refs: dict, reveal: bool = False):
+    """Fill in Refs. An InfisicalRef becomes its value only with reveal=True (the API call
+    itself); whatever is printed or logged keeps the placeholder."""
     if isinstance(obj, Ref):
         if obj.key not in refs:
             raise MissingRef(repr(obj))
         return refs[obj.key]
+    if isinstance(obj, InfisicalRef):
+        return obj.source.value(obj.key) if reveal else repr(obj)
     if isinstance(obj, dict):
-        return {k: resolve(v, refs) for k, v in obj.items()}
+        return {k: resolve(v, refs, reveal) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [resolve(v, refs) for v in obj]
+        return [resolve(v, refs, reveal) for v in obj]
     if isinstance(obj, tuple):
-        return "".join(str(resolve(v, refs)) for v in obj)
+        return "".join(str(resolve(v, refs, reveal)) for v in obj)
     return obj
 
 
 def show(obj):
     """JSON-ish rendering where Refs print as <new ...>."""
     def conv(o):
-        if isinstance(o, Ref):
+        if isinstance(o, (Ref, InfisicalRef)):
             return repr(o)
         if isinstance(o, dict):
             return {k: conv(v) for k, v in o.items()}
@@ -473,6 +681,123 @@ class RootFiles:
         if proc.returncode != 0:
             raise RuntimeError(f"could not remove {path}: {proc.stderr.strip()[:300]}")
 
+    def read_text(self, path: str) -> str | None:
+        """A root-only config file, read only; None when it is missing or unreadable."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            proc = subprocess.run(["sudo", "-n", "cat", "--", path], capture_output=True,
+                                  text=True, check=False)
+            return proc.stdout if proc.returncode == 0 else None
+
+
+class InfisicalUnavailable(Exception):
+    pass
+
+
+class Infisical:
+    """Read-only Infisical client: the Rig's machine identity (CID, CSEC, WID, INFENV, API in
+    /opt/grc/.infisical, the documented way to read Infisical on the Rig). It only answers
+    whether a secret exists at path /, and gives its value when a change is applied. The
+    identity, the access token and the values stay in memory; they are never printed."""
+
+    KEYS = ("CID", "CSEC", "WID", "INFENV", "API")
+
+    def __init__(self, env_file: str, timeout: int = 20):
+        self.env_file = env_file
+        self.timeout = timeout
+        self.__cfg: dict | None = None
+        self.__token: str | None = None
+        self.__values: dict[str, str | None] = {}
+
+    def describe(self) -> str:
+        return f"identity {self.env_file}, path /"
+
+    def _config(self) -> dict:
+        if self.__cfg is None:
+            try:
+                with open(self.env_file, encoding="utf-8") as fh:
+                    text = fh.read()
+            except FileNotFoundError:
+                raise InfisicalUnavailable(f"{self.env_file} not found") from None
+            except PermissionError:
+                proc = subprocess.run(["sudo", "-n", "grep", "-E", "^(CID|CSEC|WID|INFENV|API)=",
+                                       self.env_file], capture_output=True, text=True,
+                                      check=False)
+                if proc.returncode != 0:
+                    raise InfisicalUnavailable(f"cannot read {self.env_file} with sudo -n "
+                                               f"(exit {proc.returncode})") from None
+                text = proc.stdout
+            cfg = {k: parse_env_value(text, k) for k in self.KEYS}
+            missing = [k for k, v in cfg.items() if not v]
+            if missing:
+                raise InfisicalUnavailable(f"{self.env_file} lacks {', '.join(missing)}")
+            self.__cfg = cfg
+        return self.__cfg
+
+    def _call(self, method: str, path: str, params=None, body=None, auth=True):
+        """(status, json). Error bodies are never read or shown."""
+        cfg = self._config()
+        url = cfg["API"].rstrip("/") + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        if auth:
+            headers["Authorization"] = "Bearer " + self._login()
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw.decode()) if raw else None)
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise InfisicalUnavailable(f"{cfg['API']} did not answer ({type(exc).__name__})") from None
+
+    def _login(self) -> str:
+        if self.__token is None:
+            cfg = self._config()
+            status, data = self._call("POST", "/api/v1/auth/universal-auth/login",
+                                      body={"clientId": cfg["CID"], "clientSecret": cfg["CSEC"]},
+                                      auth=False)
+            token = (data or {}).get("accessToken") if status == 200 else None
+            if not token:
+                raise InfisicalUnavailable(f"universal-auth login refused (HTTP {status})")
+            self.__token = token
+        return self.__token
+
+    def _fetch(self, key: str) -> str | None:
+        if key not in self.__values:
+            cfg = self._config()
+            status, data = self._call("GET", f"/api/v3/secrets/raw/{urllib.parse.quote(key)}",
+                                      {"workspaceId": cfg["WID"], "environment": cfg["INFENV"],
+                                       "secretPath": "/"})
+            if status == 404:
+                self.__values[key] = None
+            elif status == 200:
+                value = ((data or {}).get("secret") or {}).get("secretValue")
+                self.__values[key] = value or None
+            else:
+                raise InfisicalUnavailable(f"reading a secret answered HTTP {status}")
+        return self.__values[key]
+
+    def missing(self, keys) -> list[str]:
+        """The names in `keys` that Infisical does not have (or has empty)."""
+        return [k for k in keys if self._fetch(k) is None]
+
+    def value(self, key: str) -> str:
+        value = self._fetch(key)
+        if value is None:
+            raise InfisicalUnavailable(f"{key} is not in Infisical")
+        return value
+
 
 # ============================================================================
 # live state (GET only)
@@ -492,6 +817,11 @@ class Snapshot:
         self.user_write_stages = a("/stages/user_write/")
         self.ident_stages = a("/stages/identification/")
         self.expr_policies = a("/policies/expression/")
+        self.reputation_policies = a("/policies/reputation/")
+        self.reputation_scores = ((g("/policies/reputation/scores/", page_size=1) or {})
+                                  .get("pagination") or {}).get("count", 0)
+        self.password_stages = a("/stages/password/")
+        self.captcha_stages = a("/stages/captcha/")
         self.policy_bindings = a("/policies/bindings/")
         self.groups = a("/core/groups/", include_users="false")
         self.users = a("/core/users/", include_groups="false")
@@ -602,6 +932,7 @@ class Plan:
         self.checks: list[tuple[str, str]] = []
         self.ops: list[Op] = []
         self.texts: dict[str, str] = {}
+        self.displays: dict[str, str] = {}
 
     def ok(self, msg):
         self.checks.append(("OK", msg))
@@ -619,8 +950,10 @@ class Plan:
         self.ops.append(op)
         return op
 
-    def text(self, name: str, value: str):
+    def text(self, name: str, value: str, display: str | None = None):
         self.texts[name] = value
+        if display is not None:
+            self.displays[name] = display
 
     def blockers(self) -> list[str]:
         out = [m for lvl, m in self.checks if lvl == "BLOCK"]
@@ -634,9 +967,11 @@ class Plan:
         return list(dict.fromkeys(out))
 
 
-def ensure_expression_policy(p: Plan, s: Snapshot, name: str, expression: str, why: str):
-    """Returns the policy pk or a Ref to the policy created by this plan."""
-    p.text(f"EXPRESSION {name}", expression)
+def ensure_expression_policy(p: Plan, s: Snapshot, name: str, expression: str, why: str,
+                             display: str | None = None):
+    """Returns the policy pk or a Ref to the policy created by this plan. `display` is what
+    the dry-run prints instead of a very long expression."""
+    p.text(f"EXPRESSION {name}", expression, display)
     pol = find(s.expr_policies, name=name)
     if pol is None:
         ref = Ref(f"policy.{name}", f"policy {name}")
@@ -650,7 +985,9 @@ def ensure_expression_policy(p: Plan, s: Snapshot, name: str, expression: str, w
                  "script's version", "PATCH", ("/policies/expression/", pol["pk"], "/"),
                  {"expression": expression}, before={"expression": pol.get("expression")},
                  inverse=inv("PATCH", ("/policies/expression/", pol["pk"], "/"),
-                             {"expression": pol.get("expression")})))
+                             {"expression": pol.get("expression")}),
+                 show_inverse=(None if display is None else {"expression": (
+                     f"<the previous expression, {len(pol.get('expression') or '')} characters>")})))
     else:
         p.ok(f"expression policy '{name}' exists and is current (pk {pol['pk']})")
     return pol["pk"]
@@ -667,10 +1004,11 @@ def binding_exists(s: Snapshot, target, policy=None, group=None):
     return None
 
 
-def add_binding(p: Plan, key: str, desc: str, target, policy=None, group=None, order=0):
+def add_binding(p: Plan, key: str, desc: str, target, policy=None, group=None, order=0,
+                negate=False, failure_result=False):
     ref = Ref(f"binding.{key}", f"binding {key}")
     body = {"target": target, "policy": policy, "group": group, "user": None, "order": order,
-            "enabled": True, "negate": False, "timeout": 30, "failure_result": False}
+            "enabled": True, "negate": negate, "timeout": 30, "failure_result": failure_result}
     p.add(Op(f"binding.{key}", desc, "POST", "/policies/bindings/", body,
              capture={ref.key: "pk"}, inverse=inv("DELETE", ("/policies/bindings/", ref, "/"))))
 
@@ -895,6 +1233,364 @@ def plan_trust(s: Snapshot, o) -> Plan:
         p.ok(f"no two of the {len(s.users)} accounts share an email today")
     p.info("API-created accounts (control plane D1, LoveJoos) do not pass through flows: their "
            "creators must check the email is unused first (see contract IDENTITY-GROUPS)")
+    return p
+
+
+# ---------------------------------------------------------------------------
+def load_disposable(path: str | None = None, commit_path: str | None = None):
+    """The vendored list as (text, domains, source commit). ValueError when the file is not
+    the pinned one or holds anything but plain lowercase domain names (the text goes into a
+    policy expression, so nothing else may get in)."""
+    path = path or DISPOSABLE_FILE
+    commit_path = commit_path or DISPOSABLE_COMMIT_FILE
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != DISPOSABLE_SHA256:
+        raise ValueError(f"{path} has sha256 {digest[:16]}..., not the pinned "
+                         f"{DISPOSABLE_SHA256[:16]}... (vendor the list byte for byte and change "
+                         "DISPOSABLE_SHA256 on purpose)")
+    with open(commit_path, encoding="utf-8") as fh:
+        commit = fh.read().strip()
+    if commit != DISPOSABLE_COMMIT:
+        raise ValueError(f"{commit_path} names commit {commit[:12]}, not {DISPOSABLE_COMMIT[:12]}")
+    text = raw.decode("ascii")
+    if not text.endswith("\n"):
+        raise ValueError(f"{path} does not end with a newline")
+    domains = text[:-1].split("\n")
+    bad = [d for d in domains if not DISPOSABLE_DOMAIN_RE.fullmatch(d)]
+    if bad:
+        raise ValueError(f"{path}: {len(bad)} line(s) are not plain lowercase domain names, "
+                         f"e.g. {bad[0][:40]!r}")
+    return text, domains, commit
+
+
+def disposable_expression(text: str, count: int, commit: str) -> tuple[str, str]:
+    """(the policy expression, the same with the domain list left out for printing)."""
+    head = (DISPOSABLE_EXPR_TEMPLATE.replace("@COMMIT@", commit).replace("@COUNT@", str(count))
+            .replace("@SHA256@", DISPOSABLE_SHA256))
+    expr = head.replace("@DOMAINS@", text, 1)
+    shown = head.replace("@DOMAINS@", f"<{count} domains from abuse/disposable_domains.txt "
+                         f"(sha256 {DISPOSABLE_SHA256[:16]}...), not printed>\n", 1)
+    return expr, shown
+
+
+def is_disposable(email: str, blocked) -> bool:
+    """The policy's own test, for reporting existing accounts (see DISPOSABLE_EXPR_TEMPLATE)."""
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return False
+    labels = [x for x in email.rsplit("@", 1)[1].strip().rstrip(".").split(".") if x]
+    return any(".".join(labels[i:]) in blocked for i in range(len(labels)))
+
+
+def caddy_xff_pinned(text: str | None) -> tuple[bool, str]:
+    """Does every reverse_proxy block of the auth site pin X-Forwarded-For to the real client?
+    authentik 2025.12 takes the FIRST X-Forwarded-For entry as the client IP (ak_client_ip,
+    events, reputation), and Caddy keeps a client-supplied one when the hop in front of it
+    (cloudflared on 127.0.0.1) is a trusted proxy."""
+    if text is None:
+        return False, "could not be read"
+    lines = [ln.split("#", 1)[0].strip() for ln in text.splitlines()]
+    blocks = pinned = 0
+    for i, line in enumerate(lines):
+        if not re.match(r"reverse_proxy\b", line):
+            continue
+        blocks += 1
+        depth = line.count("{") - line.count("}")
+        found = False
+        j = i + 1
+        while depth > 0 and j < len(lines):
+            if CADDY_XFF_PIN.fullmatch(lines[j]):
+                found = True
+            depth += lines[j].count("{") - lines[j].count("}")
+            j += 1
+        pinned += found
+    if not blocks:
+        return False, "has no reverse_proxy block"
+    return pinned == blocks, (f"{pinned} of {blocks} reverse_proxy block(s) pin X-Forwarded-For "
+                              "to the real client")
+
+
+def email_prompt_stages(p: Plan, s: Snapshot) -> dict:
+    """The prompt stages wopr-email-guard covers: they write `email` in a flow (the first-boot
+    admin setup stage is skipped on purpose, as in phase trust)."""
+    out = {}
+    for st in sorted(s.prompt_stages, key=lambda x: x["name"]):
+        if "email" not in s.prompt_keys(st) or st["name"] in SKIP_EMAIL_STAGES:
+            continue
+        if s.flows_of_stage(st["pk"]):
+            out[st["name"]] = st
+    for name in REQUIRED_EMAIL_STAGES:
+        if name not in out:
+            p.block(f"prompt stage '{name}' (named in D0) was not found writing email in a flow")
+    return out
+
+
+def login_flows(s: Snapshot) -> list:
+    """Authentication flows with a password stage: what a password guesser can use."""
+    out = []
+    for f in sorted(s.flows, key=lambda x: x["slug"]):
+        if f.get("designation") != "authentication":
+            continue
+        comps = {(b.get("stage_obj") or {}).get("component") for b in s.flow_bindings
+                 if b["target"] == f["pk"]}
+        if PASSWORD_COMPONENT in comps:
+            out.append(f)
+    return out
+
+
+def ensure_reputation_policy(p: Plan, s: Snapshot):
+    pol = find(s.reputation_policies, name=POLICY_REPUTATION)
+    if pol is None:
+        ref = Ref(f"policy.{POLICY_REPUTATION}", f"policy {POLICY_REPUTATION}")
+        p.add(Op(f"policy.{POLICY_REPUTATION}", f"create reputation policy '{POLICY_REPUTATION}' "
+                 "(authentik's built-in check: true when the client IP's score, summed over every "
+                 f"username tried from it, is {REPUTATION_ATTRS['threshold']} or lower)", "POST",
+                 "/policies/reputation/",
+                 {"name": POLICY_REPUTATION, "execution_logging": False, **REPUTATION_ATTRS},
+                 capture={ref.key: "pk"},
+                 inverse=inv("DELETE", ("/policies/reputation/", ref, "/"))))
+        return ref
+    diff = {k: v for k, v in REPUTATION_ATTRS.items() if pol.get(k) != v}
+    if diff:
+        before = {k: pol.get(k) for k in diff}
+        p.add(Op(f"policy.{POLICY_REPUTATION}.fix", f"reputation policy '{POLICY_REPUTATION}': "
+                 f"{', '.join(diff)} back to the intended value", "PATCH",
+                 ("/policies/reputation/", pol["pk"], "/"), diff, before=before,
+                 inverse=inv("PATCH", ("/policies/reputation/", pol["pk"], "/"), before)))
+    else:
+        p.ok(f"reputation policy '{POLICY_REPUTATION}' exists as intended (pk {pol['pk']})")
+    return pol["pk"]
+
+
+def plan_login_gates(p: Plan, s: Snapshot, gate):
+    for f in login_flows(s):
+        slug, mode = f["slug"], f.get("policy_engine_mode")
+        binds = [b for b in s.policy_bindings if b["target"] == f["pk"]]
+        if any(b.get("policy") == gate for b in binds):
+            p.ok(f"login flow '{slug}' already has {POLICY_REPUTATION_GATE} (mode {mode})")
+            continue
+        others = [b for b in binds if b.get("policy") != gate]
+        if others and mode != "all":
+            p.warn(f"login flow '{slug}' has {len(others)} other flow binding(s) in policy engine "
+                   f"mode '{mode}': the gate would only be one of several alternatives there, so "
+                   f"it is NOT bound (bind {POLICY_REPUTATION_GATE} by hand after reviewing them)")
+            continue
+        if mode != "all":
+            p.add(Op(f"flow.{slug}.mode", f"login flow '{slug}': policy engine mode {mode} -> all "
+                     "(it has no flow bindings yet, so nothing changes now; a binding added later "
+                     "can never open the gate)", "PATCH", ("/flows/instances/", slug, "/"),
+                     {"policy_engine_mode": "all"}, before={"policy_engine_mode": mode},
+                     inverse=inv("PATCH", ("/flows/instances/", slug, "/"),
+                                 {"policy_engine_mode": mode})))
+        add_binding(p, f"repgate.{slug}", f"bind {POLICY_REPUTATION_GATE} to login flow '{slug}' "
+                    "(checked when the flow starts; if the check itself fails with an error the "
+                    "login goes ahead, so a fault cannot lock everyone out)", f["pk"],
+                    policy=gate, order=0, failure_result=True)
+
+
+def plan_captcha(p: Plan, s: Snapshot, o, relay):
+    """Cloudflare Turnstile between the sign-up prompt and the user write stage, only when
+    both keys are in Infisical and LoveJoos sends its relay proof (it skips the captcha)."""
+    stage = find(s.captcha_stages, name=CAPTCHA_STAGE)
+    try:
+        missing = o.infisical.missing(TURNSTILE_KEYS)
+    except InfisicalUnavailable as exc:
+        p.info(f"captcha off: Infisical could not be read ({exc}); no captcha is planned")
+        return
+    if missing:
+        p.info(f"captcha off: no Turnstile keys in Infisical ({', '.join(missing)} not found; "
+               f"{o.infisical.describe()}), so nothing is planned for the captcha")
+        if stage:
+            p.warn(f"captcha stage '{CAPTCHA_STAGE}' exists although its keys are gone from "
+                   "Infisical; it keeps the keys it was given (not changed here)")
+        return
+    if not o.lovejoos_relay_ready:
+        p.warn("captcha held back: the Turnstile keys are in Infisical, but LoveJoos /register runs "
+               f"this same flow from its server and must first send header {RELAY_HEADER} "
+               "(contract ABUSE-DEFENSE-CENTRAL), or every LoveJoos sign-up would stop at the "
+               "captcha. Re-run with --lovejoos-relay-ready once it does")
+        return
+    flow = s.flow(SELF_REG_FLOW)
+    prompt = find(s.prompt_stages, name=SIGNUP_PROMPT)
+    write = find(s.user_write_stages, name=SELF_REG_WRITE)
+    binds = sorted([b for b in s.flow_bindings if flow and b["target"] == flow["pk"]],
+                   key=lambda b: b["order"])
+    prompt_b = next((b for b in binds if prompt and b["stage"] == prompt["pk"]), None)
+    write_b = next((b for b in binds if write and b["stage"] == write["pk"]), None)
+    if prompt_b is None or write_b is None:
+        p.block(f"captcha: flow '{SELF_REG_FLOW}' needs '{SIGNUP_PROMPT}' and '{SELF_REG_WRITE}' "
+                "bound to place the captcha between them")
+        return
+    if stage is None:
+        stage_pk = Ref("stage.captcha", f"captcha stage {CAPTCHA_STAGE}")
+        p.add(Op("stage.captcha", f"create captcha stage '{CAPTCHA_STAGE}' (Cloudflare Turnstile; "
+                 "site and secret key read from Infisical when applied, never shown or logged)",
+                 "POST", "/stages/captcha/",
+                 {"name": CAPTCHA_STAGE, "public_key": InfisicalRef(TURNSTILE_KEYS[0], o.infisical),
+                  "private_key": InfisicalRef(TURNSTILE_KEYS[1], o.infisical), **TURNSTILE_ATTRS},
+                 capture={stage_pk.key: "pk"},
+                 inverse=inv("DELETE", ("/stages/captcha/", stage_pk, "/"))))
+    else:
+        stage_pk = stage["pk"]
+        if stage.get("public_key") != o.infisical.value(TURNSTILE_KEYS[0]):
+            p.block(f"captcha stage '{CAPTCHA_STAGE}' has another site key than "
+                    f"{TURNSTILE_KEYS[0]} in Infisical (keys rotated?). Its secret key cannot be "
+                    "read back to compare: roll back the antibot apply that made the stage (or "
+                    "delete it) and apply again")
+        diff = {k: v for k, v in TURNSTILE_ATTRS.items() if stage.get(k) != v}
+        if diff:
+            before = {k: stage.get(k) for k in diff}
+            p.add(Op("stage.captcha.fix", f"captcha stage '{CAPTCHA_STAGE}': {', '.join(diff)} "
+                     "back to the intended value", "PATCH", ("/stages/captcha/", stage["pk"], "/"),
+                     diff, before=before,
+                     inverse=inv("PATCH", ("/stages/captcha/", stage["pk"], "/"), before)))
+        else:
+            p.ok(f"captcha stage '{CAPTCHA_STAGE}' exists (pk {stage['pk']}, site key matches "
+                 "Infisical)")
+    bound = next((b for b in binds if b["stage"] == stage_pk), None)
+    if bound is not None:
+        fsb = bound["pk"]
+        if not prompt_b["order"] < bound["order"] < write_b["order"]:
+            p.block(f"'{CAPTCHA_STAGE}' is bound at order {bound['order']}, not between "
+                    f"'{SIGNUP_PROMPT}' ({prompt_b['order']}) and '{SELF_REG_WRITE}' "
+                    f"({write_b['order']}); fix by hand")
+        else:
+            p.ok(f"'{CAPTCHA_STAGE}' is bound to '{SELF_REG_FLOW}' at order {bound['order']}")
+    else:
+        if write_b["order"] - prompt_b["order"] < 2:
+            p.block(f"no free order between '{SIGNUP_PROMPT}' ({prompt_b['order']}) and "
+                    f"'{SELF_REG_WRITE}' ({write_b['order']}) for the captcha")
+            return
+        order = prompt_b["order"] + (write_b["order"] - prompt_b["order"]) // 2
+        fsb = Ref("fsb.captcha", "flow binding of the captcha stage")
+        p.add(Op("fsb.captcha", f"bind '{CAPTCHA_STAGE}' to flow '{SELF_REG_FLOW}' at order {order} "
+                 f"(after '{SIGNUP_PROMPT}' at {prompt_b['order']}, before '{SELF_REG_WRITE}' at "
+                 f"{write_b['order']}): no account is written without a solved captcha", "POST",
+                 "/flows/bindings/",
+                 {"target": flow["pk"], "stage": stage_pk, "order": order,
+                  "evaluate_on_plan": False, "re_evaluate_policies": True,
+                  "policy_engine_mode": "any", "invalid_response_action": "retry"},
+                 capture={fsb.key: "pk"}, inverse=inv("DELETE", ("/flows/bindings/", fsb, "/"))))
+    if bound is not None and any(b.get("policy") == relay and b.get("negate")
+                                 for b in s.policy_bindings if b["target"] == bound["pk"]):
+        p.ok(f"the captcha is skipped only with LoveJoos's relay proof ({POLICY_RELAY}, negated)")
+    else:
+        add_binding(p, "captcha_relay_skip", f"bind {POLICY_RELAY} NEGATED to the captcha's flow "
+                    "binding: the captcha is skipped only for a request with LoveJoos's relay proof "
+                    "(LoveJoos runs its own proof-of-work); if that check fails with an error the "
+                    "captcha is shown", fsb, policy=relay, order=0, negate=True,
+                    failure_result=True)
+
+
+def plan_antibot(s: Snapshot, o) -> Plan:
+    p = Plan("antibot")
+
+    # Can authentik trust the client IP it sees?
+    site = o.caddy_site
+    pinned, detail = caddy_xff_pinned(o.files.read_text(site))
+    if pinned:
+        p.ok(f"{site}: {detail}, so ak_client_ip (the first X-Forwarded-For entry) is the real "
+             "client (Caddy's client_ip, from Cloudflare's CF-Connecting-IP)")
+    else:
+        p.warn(f"{site}: {detail}. authentik takes the FIRST X-Forwarded-For entry as the client "
+               "IP and Caddy passes on one the client sent, so anyone can choose the IP authentik "
+               "sees: the per-IP sign-up cap can be dodged until this is fixed, and the "
+               "reputation gate is held back (anyone could lock another IP out of signing in). "
+               f"Fix: {XFF_FIX}, then run this phase again")
+
+    # What protects the login today (read-only report)
+    pw = "; ".join(f"password stage '{x['name']}' ends a flow after "
+                   f"{x.get('failed_attempts_before_cancel')} wrong passwords"
+                   for x in s.password_stages) or "no password stage found"
+    reps = ", ".join(f"'{x['name']}'" for x in s.reputation_policies) or "none"
+    p.info(f"login protection found: {pw}; authentik keeps a reputation score per username and "
+           f"client IP ({s.reputation_scores} on record); reputation policies: {reps}")
+
+    # 1. the policies, each created before anything refers to it
+    relay = ensure_expression_policy(
+        p, s, POLICY_RELAY, RELAY_EXPR, f"true only for LoveJoos's server: header {RELAY_HEADER} "
+        f"= the key of its API token '{LJ_TOKEN_ID}'")
+    ip_limit = ensure_expression_policy(
+        p, s, POLICY_SIGNUP_IP, SIGNUP_IP_EXPR, f"at most {SIGNUP_IP_LIMIT} sign-ups per client IP "
+        f"per {SIGNUP_IP_WINDOW_HOURS}h, from authentik's user_write events")
+    disposable = None
+    try:
+        text, domains, commit = load_disposable()
+    except (OSError, ValueError) as exc:
+        p.block(f"disposable-email list: {exc}")
+    else:
+        expr, shown = disposable_expression(text, len(domains), commit)
+        p.info(f"disposable-email list: {len(domains)} domains (disposable-email-domains commit "
+               f"{commit[:12]}, sha256 {DISPOSABLE_SHA256[:16]}..., pinned), embedded in the "
+               f"policy: {len(expr)} characters")
+        disposable = ensure_expression_policy(
+            p, s, POLICY_DISPOSABLE, expr, "refuses a new address on a throwaway-inbox domain or "
+            "a subdomain of one", display=shown)
+        blocked = frozenset(domains)
+        users = [u for u in s.users if is_disposable(u.get("email"), blocked)]
+        if users:
+            p.info(f"{len(users)} existing account(s) already use a throwaway domain (they keep "
+                   "it; they cannot switch to another one): "
+                   + ", ".join(mask_email(u.get("email")) for u in users))
+        else:
+            p.ok(f"none of the {len(s.users)} accounts uses a throwaway domain today")
+    gate = None
+    gate_pol = find(s.expr_policies, name=POLICY_REPUTATION_GATE)
+    if pinned:
+        ensure_reputation_policy(p, s)
+        gate = ensure_expression_policy(
+            p, s, POLICY_REPUTATION_GATE, REPUTATION_GATE_EXPR, "refuses a client IP with a bad "
+            f"login reputation (built-in policy '{POLICY_REPUTATION}')")
+        plan_login_gates(p, s, gate)
+    else:
+        p.info(f"reputation gate held back: nothing is bound until {site} pins X-Forwarded-For "
+               "(see the warning above)")
+        if gate_pol and any(b.get("policy") == gate_pol["pk"] for b in s.policy_bindings):
+            p.warn(f"{POLICY_REPUTATION_GATE} is bound although X-Forwarded-For is not pinned: "
+                   "anyone can now lock another IP out of signing in. Pin it again, or roll back "
+                   "the antibot apply that bound it (not changed here)")
+
+    # 2. validation policies on the prompt stages, one PATCH per stage
+    names = {POLICY_DISPOSABLE: disposable, POLICY_SIGNUP_IP: ip_limit,
+             POLICY_REPUTATION_GATE: gate}
+    stages = email_prompt_stages(p, s)
+    want: dict[str, list[str]] = {}
+    if disposable is not None:
+        for name in stages:
+            want.setdefault(name, []).append(POLICY_DISPOSABLE)
+    flow = s.flow(SELF_REG_FLOW)
+    signup = find(s.prompt_stages, name=SIGNUP_PROMPT)
+    if flow is None or signup is None or SELF_REG_FLOW not in s.flows_of_stage(signup["pk"]):
+        p.block(f"prompt stage '{SIGNUP_PROMPT}' of flow '{SELF_REG_FLOW}' not found")
+    else:
+        stages.setdefault(SIGNUP_PROMPT, signup)
+        want.setdefault(SIGNUP_PROMPT, []).append(POLICY_SIGNUP_IP)
+        if gate is not None:
+            want[SIGNUP_PROMPT].append(POLICY_REPUTATION_GATE)
+        guard = find(s.expr_policies, name=POLICY_EMAIL_GUARD)
+        if not guard or guard["pk"] not in (signup.get("validation_policies") or []):
+            p.info(f"phase trust is not applied yet ('{SIGNUP_PROMPT}' has no {POLICY_EMAIL_GUARD});"
+                   " these policies work without it and leave it alone when it comes")
+    for name in sorted(want):
+        st = stages[name]
+        current = list(st.get("validation_policies") or [])
+        add = [n for n in want[name] if names[n] not in current]
+        if not add:
+            p.ok(f"prompt stage '{name}' already has {', '.join(want[name])}")
+            continue
+        flows = ", ".join(s.flows_of_stage(st["pk"]))
+        p.add(Op(f"stage.{name}.antibot", f"add {', '.join(add)} to prompt stage '{name}' (flows: "
+                 f"{flows}) as validation policies, keeping the ones it has", "PATCH",
+                 ("/stages/prompt/stages/", st["pk"], "/"),
+                 {"validation_policies": current + [names[n] for n in add]},
+                 before={"validation_policies": current},
+                 inverse=inv("PATCH", ("/stages/prompt/stages/", st["pk"], "/"),
+                             {"validation_policies": current})))
+
+    # 3. captcha, only with keys
+    plan_captcha(p, s, o, relay)
     return p
 
 
@@ -1428,6 +2124,7 @@ def plan_bink(s: Snapshot, o) -> Plan:
 
 PLANNERS = {
     "trust": plan_trust,
+    "antibot": plan_antibot,
     "groups": plan_groups,
     "yourspace-app": plan_yourspace_app,
     "bink": plan_bink,
@@ -1469,8 +2166,10 @@ def print_plan(p: Plan, out=None):
         used = {v for op in p.ops for v in (op.body or {}).values() if isinstance(v, str)}
         for name, text in p.texts.items():
             if text in used:
-                w(f"  {name} (exact text):")
-                for line in text.rstrip("\n").split("\n"):
+                shown = p.displays.get(name)
+                w(f"  {name} (exact text"
+                  + ("" if shown is None else ", except the part marked 'not printed'") + "):")
+                for line in (text if shown is None else shown).rstrip("\n").split("\n"):
                     w(f"      | {line}")
     blockers = p.blockers()
     if blockers:
@@ -1509,9 +2208,10 @@ def apply_plan(api: Api, p: Plan, state_dir: str, files: RootFiles) -> str:
     print(f"\nApplying phase {p.phase}: {len(p.ops)} change(s); log {log_path}")
     try:
         for i, op in enumerate(p.ops, 1):
-            path, body = resolve(op.path, refs), resolve(op.body, refs)
+            # An InfisicalRef is read only for the call itself; the log keeps the placeholder.
+            path, body = resolve(op.path, refs), resolve(op.body, refs, reveal=True)
             entry = {"n": i, "key": op.key, "desc": op.desc, "method": op.method, "path": path,
-                     "body": body, "before": op.before}
+                     "body": resolve(op.body, refs), "before": op.before}
             if op.method == "TOKEN_FILE":
                 result = token_file_write(api, files, body["token_identifier"], path)
             else:
@@ -1541,6 +2241,15 @@ def apply_plan(api: Api, p: Plan, state_dir: str, files: RootFiles) -> str:
         log["finished"] = now_utc()
         write_log(log_path, log)
     return log_path
+
+
+def same_value(current, logged) -> bool:
+    """Rollback drift check. Lists of ids compare as sets: authentik does not promise the
+    order of many-to-many fields such as validation_policies."""
+    if (isinstance(current, list) and isinstance(logged, list)
+            and all(isinstance(x, (str, int)) for x in current + logged)):
+        return sorted(map(str, current)) == sorted(map(str, logged))
+    return current == logged
 
 
 def rollback(api: Api, log_path: str, dry: bool, force: bool, files: RootFiles,
@@ -1575,7 +2284,8 @@ def rollback(api: Api, log_path: str, dry: bool, force: bool, files: RootFiles,
                 if cur is None:
                     outcome = "skipped: object is gone"
                 else:
-                    drift = [k for k, v in (e.get("body") or {}).items() if cur.get(k) != v]
+                    drift = [k for k, v in (e.get("body") or {}).items()
+                             if not same_value(cur.get(k), v)]
                     if drift:
                         outcome = f"SKIPPED: changed since the apply ({', '.join(drift)}); --force"
                         rc = 4
@@ -1698,6 +2408,19 @@ SCHEMA_USES = [
     ("get", "/core/tokens/{identifier}/view_key/", ()),
     ("get", "/events/events/", ()), ("get", "/oauth2/refresh_tokens/", ()),
     ("get", "/oauth2/access_tokens/", ()),
+    # antibot (WOPR-059)
+    ("get", "/policies/reputation/", ()), ("get", "/policies/reputation/scores/", ()),
+    ("post", "/policies/reputation/", ("name", "execution_logging", "check_ip", "check_username",
+                                       "threshold")),
+    ("patch", "/policies/reputation/{policy_uuid}/", ("check_ip", "check_username", "threshold")),
+    ("delete", "/policies/reputation/{policy_uuid}/", ()),
+    ("get", "/stages/password/", ()), ("get", "/stages/captcha/", ()),
+    ("post", "/stages/captcha/", ("name", "public_key", "private_key", "js_url", "api_url",
+                                  "interactive", "error_on_invalid_score")),
+    ("patch", "/stages/captcha/{stage_uuid}/", ("js_url", "api_url", "interactive",
+                                                "error_on_invalid_score")),
+    ("delete", "/stages/captcha/{stage_uuid}/", ()),
+    ("patch", "/flows/instances/{slug}/", ("policy_engine_mode",)),
 ]
 SCHEMA_ENUMS = {
     "SubModeEnum": ("hashed_user_id",), "ClientTypeEnum": ("public",),
@@ -1779,6 +2502,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="lovejoos-gate: confirm the LoveJoos release (WOPR-056) is live")
     ap.add_argument("--allow-barterra-orphan", action="store_true",
                     help="bink: rename even if Barterra has a link keyed on the old username")
+    ap.add_argument("--caddy-site", default=CADDY_SITE_DEFAULT,
+                    help="antibot: the auth.wopr.systems Caddy site, read only: does it pin "
+                         "X-Forwarded-For to the real client?")
+    ap.add_argument("--infisical-env", default=INFISICAL_ENV_DEFAULT,
+                    help="antibot: Infisical machine identity (CID, CSEC, WID, INFENV, API); only "
+                         "the Turnstile keys are read, never printed")
+    ap.add_argument("--lovejoos-relay-ready", action="store_true",
+                    help=f"antibot: confirm LoveJoos sends {RELAY_HEADER} on its sign-up flow "
+                         "requests (a captcha is planned only then, and only with Turnstile keys)")
     ap.add_argument("--allow-version", action="store_true",
                     help="run against an authentik version other than 2025.12.x")
     ap.add_argument("--force", action="store_true",
@@ -1786,7 +2518,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv=None, api=None, files=None) -> int:
+def main(argv=None, api=None, files=None, infisical=None) -> int:
     args = build_parser().parse_args(argv)
     if args.apply and args.dry_run:
         print("--apply and --dry-run exclude each other", file=sys.stderr)
@@ -1795,6 +2527,7 @@ def main(argv=None, api=None, files=None) -> int:
         print("--apply, --rollback and --check-schema exclude each other", file=sys.stderr)
         return 2
     args.files = files or RootFiles()
+    args.infisical = infisical or Infisical(args.infisical_env)
     writing = bool(args.apply) or (bool(args.rollback) and not args.dry_run)
     if api is None:
         api = Api(args.api, read_api_token(args.env_file), write_enabled=writing)

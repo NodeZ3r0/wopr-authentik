@@ -2,13 +2,16 @@
 (read-only probe of 2026-10-05) and fake emails. Run: python3 -m unittest -v"""
 import contextlib
 import copy
+import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
 import sys
 import tempfile
 import textwrap
+import time
 import types
 from datetime import datetime, timedelta, timezone
 import unittest
@@ -46,6 +49,7 @@ APP_LJ = "c811f847-5ba3-4aad-8e19-e819b877c773"
 APP_BARTER = "bc6baad9-d5b5-4efd-ab16-8b577bbc344a"
 KEY_AK = "74158c91-a26e-4f14-aa7b-421b897089ff"
 MAP_OPENID = "6efe2f53-d8c3-4bcf-a36f-fc3d1863f6d6"
+S_PASSWORD = "5f0c2a9e-1b7d-4c3e-9a8f-2d6b4e1c7a90"
 
 
 def prompt(pk, key, typ="text"):
@@ -67,11 +71,14 @@ def fixture():
     return {
         "version": "2025.12.4",
         "settings": {"default_user_change_email": False, "default_user_change_username": False},
-        "flows": [{"pk": F_SELFREG, "slug": "self-registration"},
-                  {"pk": F_AUTH, "slug": "default-authentication-flow"},
+        "flows": [{"pk": F_SELFREG, "slug": "self-registration", "designation": "enrollment",
+                   "policy_engine_mode": "any"},
+                  {"pk": F_AUTH, "slug": "default-authentication-flow",
+                   "designation": "authentication", "policy_engine_mode": "any"},
                   {"pk": F_SETTINGS, "slug": "default-user-settings-flow"},
                   {"pk": F_ONBOARD, "slug": "user-onboarding"},
-                  {"pk": F_BRAIN, "slug": "brainjoos-authentication"},
+                  {"pk": F_BRAIN, "slug": "brainjoos-authentication",
+                   "designation": "authentication", "policy_engine_mode": "any"},
                   {"pk": F_OOBE, "slug": "initial-setup"},
                   {"pk": F_RECOVERY, "slug": "password-recovery"},
                   {"pk": F_IMPLICIT, "slug": "default-provider-authorization-implicit-consent"},
@@ -81,6 +88,9 @@ def fixture():
             fb(F_SELFREG, S_SELFREG_WRITE, "self-registration-write", 20, "ak-stage-user-write-form"),
             fb(F_SELFREG, S_SELFREG_LOGIN, "self-registration-login", 30, "ak-stage-user-login-form"),
             fb(F_AUTH, S_IDENT, "default-authentication-identification", 10),
+            fb(F_AUTH, S_PASSWORD, "default-authentication-password", 20, "ak-stage-password-form"),
+            fb(F_BRAIN, S_IDENT, "default-authentication-identification", 10),
+            fb(F_BRAIN, S_PASSWORD, "default-authentication-password", 20, "ak-stage-password-form"),
             fb(F_AUTH, S_ONBOARD_PROMPT, "onboarding-profile-prompt", 110),
             fb(F_BRAIN, S_ONBOARD_PROMPT, "onboarding-profile-prompt", 110),
             fb(F_ONBOARD, S_ONBOARD_PROMPT, "onboarding-profile-prompt", 10),
@@ -113,6 +123,11 @@ def fixture():
                           "sources": []}],
         "expr_policies": [{"pk": P_SETTINGS_AUTHZ, "name": "default-user-settings-authorization",
                            "expression": "return True"}],
+        "reputation_policies": [],
+        "reputation_scores": [{"score": -5}, {"score": 1}],
+        "password_stages": [{"pk": S_PASSWORD, "name": "default-authentication-password",
+                             "failed_attempts_before_cancel": 5}],
+        "captcha_stages": [],
         "policy_bindings": [{"pk": str(uuid.uuid4()), "target": str(uuid.uuid4()),
                              "group": G_ADMINS, "policy": None, "user": None, "order": 0}],
         "groups": [
@@ -201,8 +216,12 @@ class FakeApi:
         "/sources/user_connections/oauth/": ("source_connections", "pk", "int"),
         "/propertymappings/provider/scope/": ("scope_mappings", "pk", "uuid"),
         "/crypto/certificatekeypairs/": ("keypairs", "pk", "uuid"),
+        "/policies/reputation/": ("reputation_policies", "pk", "uuid"),
+        "/stages/password/": ("password_stages", "pk", "uuid"),
+        "/stages/captcha/": ("captcha_stages", "pk", "uuid"),
     }
     IGNORED = {"page", "page_size", "include_users", "include_groups", "ordering"}
+    WRITE_ONLY = {"/stages/captcha/": ("private_key",)}  # authentik never returns these
 
     def __init__(self, state):
         self.st = state
@@ -226,6 +245,12 @@ class FakeApi:
             if str(it.get(idf)) == str(ident):
                 return it
         return None
+
+    def _public(self, prefix, obj):
+        obj = copy.deepcopy(obj)
+        for field in self.WRITE_ONLY.get(prefix, ()):
+            obj.pop(field, None)
+        return obj
 
     def _role_perms(self, role):
         return self.st["role_perms"].setdefault(role, {"global": set(), "object": set()})
@@ -272,6 +297,8 @@ class FakeApi:
                 ev = sorted(ev, key=lambda e: e["created"])
             return {"results": ev[: int(params.get("page_size", 100))],
                     "pagination": {"count": len(ev), "next": 0}} if paginated else ev
+        if path == "/policies/reputation/scores/":
+            return {"results": [], "pagination": {"count": len(st["reputation_scores"]), "next": 0}}
         if path in ("/oauth2/refresh_tokens/", "/oauth2/access_tokens/"):
             return [] if not paginated else {"results": [], "pagination": {"count": 0}}
         if path == "/rbac/permissions/":
@@ -306,13 +333,13 @@ class FakeApi:
                 if k in self.IGNORED:
                     continue
                 items = [it for it in items if str(it.get(k)) == str(v)]
-            items = copy.deepcopy(items)
+            items = [self._public(prefix, x) for x in items]
             return {"results": items, "pagination": {"next": 0}} if paginated else items
         it = self._item(prefix, parts[0])
         if it is None:
             raise ai.ApiError("GET", path, 404, "not found")
         if len(parts) == 1:
-            return copy.deepcopy(it)
+            return self._public(prefix, it)
         if parts[1] == "used_by":
             return []
         if parts[1] == "view_key":
@@ -361,7 +388,8 @@ class FakeApi:
                 raise ai.ApiError(method, path, 400, "name exists")
             if prefix == "/flows/bindings/":
                 names = {s["pk"]: s["name"] for k in ("prompt_stages", "email_stages",
-                                                      "user_write_stages") for s in st[k]}
+                                                      "user_write_stages", "captcha_stages")
+                         for s in st[k]}
                 obj["stage_obj"] = {"name": names.get(obj["stage"], "?"), "component": "x"}
             if prefix == "/core/users/":
                 obj.setdefault("uid", "uid-" + str(obj["pk"]))
@@ -400,6 +428,10 @@ class FakeApi:
 class FakeFiles:
     def __init__(self):
         self.files = {}
+        self.texts = {}  # read-only config files (the Caddy site)
+
+    def read_text(self, path):
+        return self.texts.get(path)
 
     def exists(self, path):
         return bool(self.files.get(path))
@@ -411,19 +443,47 @@ class FakeFiles:
         self.files.pop(path, None)
 
 
-def run(argv, api, files=None):
+class FakeInfisical:
+    """Infisical at path /: `values` holds the secrets that exist."""
+
+    def __init__(self, values=None, broken=False):
+        self.values = dict(values or {})
+        self.broken = broken
+        self.value_reads = []
+
+    def describe(self):
+        return "fake Infisical"
+
+    def missing(self, keys):
+        if self.broken:
+            raise ai.InfisicalUnavailable("fake: no answer")
+        return [k for k in keys if not self.values.get(k)]
+
+    def value(self, key):
+        if self.broken or not self.values.get(key):
+            raise ai.InfisicalUnavailable(f"{key} unavailable")
+        self.value_reads.append(key)
+        return self.values[key]
+
+
+def run(argv, api, files=None, infisical=None):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        rc = ai.main(argv, api=api, files=files or FakeFiles())
+        rc = ai.main(argv, api=api, files=files or FakeFiles(),
+                     infisical=infisical or FakeInfisical())
     return rc, buf.getvalue()
 
 
 def essence(st, files):
     """Comparable view of the fake state (ids of recreated objects ignored)."""
-    pol = {p["pk"]: p["name"] for p in st["expr_policies"]}
+    pol = {p["pk"]: p["name"] for p in st["expr_policies"] + st["reputation_policies"]}
     grp = {g["pk"]: g["name"] for g in st["groups"]}
     return json.dumps({
         "settings": st["settings"],
+        "reputation": sorted((p["name"], p.get("check_ip"), p.get("check_username"),
+                              p.get("threshold")) for p in st["reputation_policies"]),
+        "captcha": sorted(c["name"] for c in st["captcha_stages"]),
+        "flow_modes": sorted((f["slug"], f.get("policy_engine_mode") or "") for f in st["flows"]),
         "policies": sorted((p["name"], p["expression"]) for p in st["expr_policies"]),
         "prompt": sorted((s["name"], [pol.get(x, x) for x in s["validation_policies"]])
                          for s in st["prompt_stages"]),
@@ -440,7 +500,8 @@ def essence(st, files):
         "tokens": sorted(t["identifier"] for t in st["tokens"]),
         "providers": sorted(p["client_id"] for p in st["providers"]),
         "apps": sorted((a["slug"], a.get("provider"), a.get("policy_engine_mode")) for a in st["apps"]),
-        "bindings": sorted((b["target"], pol.get(b.get("policy")), grp.get(b.get("group")))
+        "bindings": sorted((b["target"], pol.get(b.get("policy")), grp.get(b.get("group")),
+                            bool(b.get("negate")), bool(b.get("failure_result")))
                            for b in st["policy_bindings"]),
         "perms": sorted((r, sorted(map(str, v["global"])), sorted(map(str, v["object"])))
                         for r, v in st["role_perms"].items() if v["global"] or v["object"]),
@@ -472,7 +533,13 @@ class DryRunTests(unittest.TestCase):
                        "bind group 'yourspace-members' to app 'yourspace'",
                        "pk 23: username, name, attributes",
                        "add existing LoveJoos user nodez3r0 (pk 7) to lovejoos-users",
-                       "bind group 'lovejoos-users' to app 'lovejoos'"):
+                       "bind group 'lovejoos-users' to app 'lovejoos'",
+                       "create expression policy 'wopr-signup-relay'",
+                       "create expression policy 'wopr-disposable-email'",
+                       "add wopr-disposable-email, wopr-signup-ip-limit to prompt stage "
+                       "'self-registration-prompt'",
+                       "captcha off: no Turnstile keys in Infisical",
+                       "reputation gate held back"):
             self.assertIn(needle, out)
         # the access_code attribute value is never shown
         self.assertNotIn("kept-secret-ish", out)
@@ -514,13 +581,15 @@ class ApplyTests(unittest.TestCase):
         self.orig = copy.deepcopy(self.st)
         self.api = FakeApi(self.st)
         self.files = FakeFiles()
+        self.infisical = FakeInfisical()
         self.emails = os.path.join(self.tmp, "lj.txt")
         with open(self.emails, "w") as fh:
             fh.write("# LoveJoos users with a central login\nljfan@example.org\n"
                      "nobody@example.org\nsbinkerd1@gmail.com\n")
 
     def apply(self, phase, *extra):
-        return run(["--apply", phase, "--state-dir", self.tmp, *extra], self.api, self.files)
+        return run(["--apply", phase, "--state-dir", self.tmp, *extra], self.api, self.files,
+                   self.infisical)
 
     def logs(self):
         return sorted(os.path.join(self.tmp, f) for f in os.listdir(self.tmp)
@@ -528,7 +597,8 @@ class ApplyTests(unittest.TestCase):
 
     def test_full_cycle_idempotent_and_reversible(self):
         gate = ("--lovejoos-release-deployed", "--lovejoos-emails", self.emails)
-        for phase, extra in (("trust", ()), ("groups", ()), ("yourspace-app", ()), ("bink", ()),
+        for phase, extra in (("trust", ()), ("antibot", ()), ("groups", ()), ("yourspace-app", ()),
+                             ("bink", ()),
                              ("lovejoos-gate", gate)):
             rc, out = self.apply(phase, *extra)
             self.assertEqual(rc, 0, out)
@@ -546,6 +616,14 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(st["user_write_stages"][0]["create_users_as_inactive"])
         self.assertEqual(st["user_write_stages"][0]["user_path_template"], ai.SELF_REG_PATH)
         self.assertEqual({s["user_matching_mode"] for s in st["oauth_sources"]}, {"email_deny"})
+        # antibot (X-Forwarded-For not pinned here: no reputation gate; no Turnstile keys)
+        disp = next(p["pk"] for p in st["expr_policies"] if p["name"] == ai.POLICY_DISPOSABLE)
+        ip_limit = next(p["pk"] for p in st["expr_policies"] if p["name"] == ai.POLICY_SIGNUP_IP)
+        for s in st["prompt_stages"]:
+            want = s["name"] in ai.REQUIRED_EMAIL_STAGES
+            self.assertEqual(disp in s["validation_policies"], want, s["name"])
+            self.assertEqual(ip_limit in s["validation_policies"], s["name"] == ai.SIGNUP_PROMPT)
+        self.assertEqual((st["reputation_policies"], st["captcha_stages"]), ([], []))
         # groups
         names = {g["name"]: g for g in st["groups"]}
         self.assertNotIn("WOPR Admins-dup2", names)
@@ -753,7 +831,7 @@ class FakeUser:
 
 
 class ExpressionTests(unittest.TestCase):
-    def run_expr(self, expr, request, users=()):
+    def run_expr(self, expr, request, users=(), modules=None, **names):
         models = types.ModuleType("authentik.core.models")
         models.USER_ATTRIBUTE_CHANGE_EMAIL = "goauthentik.io/user/can-change-email"
 
@@ -767,15 +845,18 @@ class ExpressionTests(unittest.TestCase):
         mods = {"authentik": types.ModuleType("authentik"),
                 "authentik.core": types.ModuleType("authentik.core"),
                 "authentik.core.models": models}
+        mods.update(modules or {})
         old = {k: sys.modules.get(k) for k in mods}
         sys.modules.update(mods)
         try:
-            src = "def _f(request, ak_message, ak_logger):\n" + textwrap.indent(expr, "    ")
-            g = {}
+            args = ", ".join(["request", "ak_message", "ak_logger", *names])
+            src = f"def _f({args}):\n" + textwrap.indent(expr, "    ")
+            # authentik's evaluator globals that these policies use
+            g = {"ip_address": ipaddress.ip_address, "ip_network": ipaddress.ip_network}
             exec(compile(src, "expr", "exec"), g)
             log = types.SimpleNamespace(
                 info=lambda *a, **k: self.__dict__.setdefault("logged", []).append((a, k)))
-            return g["_f"](request, msgs.append, log), msgs
+            return g["_f"](request, msgs.append, log, *names.values()), msgs
         finally:
             for k, v in old.items():
                 if v is None:
@@ -895,6 +976,613 @@ class TokenTests(unittest.TestCase):
             self.assertEqual(ai.read_api_token(fh.name), "tok123")
         finally:
             os.unlink(fh.name)
+
+
+# ============================================================================
+# antibot (WOPR-059)
+# ============================================================================
+SITE = ai.CADDY_SITE_DEFAULT
+# auth.wopr.systems as it is on 2026-10-05 (shortened): X-Forwarded-For is NOT pinned.
+UNPINNED_SITE = """http://auth.wopr.systems:18080 {
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    @userinfo path /application/o/userinfo/*
+    handle @userinfo {
+        reverse_proxy 127.0.0.1:9091 {
+            header_down -Access-Control-Allow-Origin
+        }
+        header Access-Control-Allow-Origin "{header.Origin}"
+    }
+
+    reverse_proxy 127.0.0.1:9091 {
+        header_up -Accept-Encoding
+        header_up X-Forwarded-Proto https
+    }
+}
+"""
+PINNED_SITE = (UNPINNED_SITE
+               .replace("            header_down -Access-Control-Allow-Origin\n",
+                        "            header_down -Access-Control-Allow-Origin\n"
+                        "            header_up X-Forwarded-For {client_ip}\n")
+               .replace("        header_up X-Forwarded-Proto https\n",
+                        "        header_up X-Forwarded-Proto https\n"
+                        "        header_up X-Forwarded-For {client_ip}\n"))
+TS_SITE = "0x4AAAAAAA-site-key-for-tests"
+TS_SECRET = "0x4AAAAAAA-SECRET-KEY-MUST-NOT-LEAK"
+TS_KEYS = {"TURNSTILE_SITE_KEY": TS_SITE, "TURNSTILE_SECRET_KEY": TS_SECRET}
+IP_LIMIT_MSG = ("Too many new accounts were made from your network in the last 24 hours. "
+                "Please try again tomorrow.")
+DISPOSABLE_MSG = "Please use a permanent email address; throwaway inboxes can't be used here."
+
+
+class AntibotPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.st = fixture()
+        self.orig = copy.deepcopy(self.st)
+        self.api = FakeApi(self.st)
+        self.files = FakeFiles()
+        self.infisical = FakeInfisical()
+
+    def run_ab(self, *argv, infisical=None):
+        return run([*argv, "--state-dir", self.tmp], self.api, self.files,
+                   infisical or self.infisical)
+
+    def plan(self, argv=(), infisical=None):
+        o = ai.build_parser().parse_args(list(argv))
+        o.files, o.infisical = self.files, infisical or self.infisical
+        return ai.plan_antibot(ai.Snapshot(self.api, o), o)
+
+    def logs(self):
+        return sorted(os.path.join(self.tmp, f) for f in os.listdir(self.tmp)
+                      if f.endswith(".json") and "rollback" not in f)
+
+    def rollback(self, path):
+        rc, out = run(["--rollback", path, "--state-dir", self.tmp], self.api, self.files)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    def names(self, stage_name):
+        pol = {p["pk"]: p["name"] for p in self.st["expr_policies"]}
+        st = next(s for s in self.st["prompt_stages"] if s["name"] == stage_name)
+        return [pol.get(x, x) for x in st["validation_policies"]]
+
+    def test_dry_run_today_six_changes_captcha_off(self):
+        self.files.texts[SITE] = UNPINNED_SITE  # as on the Rig today
+        rc, out = self.run_ab("--dry-run", "--phase", "antibot")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(m == "GET" for m, _ in self.api.calls))
+        self.assertIn("Planned changes (6):", out)
+        for needle in ("create expression policy 'wopr-signup-relay'",
+                       "create expression policy 'wopr-signup-ip-limit'",
+                       "create expression policy 'wopr-disposable-email'",
+                       "add wopr-disposable-email, wopr-signup-ip-limit to prompt stage "
+                       "'self-registration-prompt'",
+                       "add wopr-disposable-email to prompt stage 'onboarding-profile-prompt'",
+                       "add wopr-disposable-email to prompt stage 'default-user-settings'",
+                       "captcha off: no Turnstile keys in Infisical",
+                       "reputation gate held back",
+                       "0 of 2 reverse_proxy block(s) pin X-Forwarded-For",
+                       "header_up X-Forwarded-For {client_ip}", "9205 domains",
+                       "not printed", "phase trust is not applied yet"):
+            self.assertIn(needle, out)
+        self.assertNotIn("APPLY WOULD BE REFUSED", out)
+        self.assertNotIn("0-mail.com", out)  # the list itself is never printed
+        self.assertNotIn("yopmail", out)
+
+    def test_apply_after_trust_idempotent_reversible_guard_untouched(self):
+        rc, out = self.run_ab("--apply", "trust")
+        self.assertEqual(rc, 0, out)
+        guard_before = next(p for p in self.st["expr_policies"]
+                            if p["name"] == ai.POLICY_EMAIL_GUARD)["expression"]
+        rc, out = self.run_ab("--apply", "antibot")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Verified: a fresh read-only plan", out)
+        rc, out = self.run_ab("--apply", "antibot")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Nothing to do", out)
+        self.assertEqual(self.names("self-registration-prompt"),
+                         [ai.POLICY_EMAIL_GUARD, ai.POLICY_DISPOSABLE, ai.POLICY_SIGNUP_IP])
+        self.assertEqual(self.names("onboarding-profile-prompt"),
+                         [ai.POLICY_EMAIL_GUARD, ai.POLICY_DISPOSABLE])
+        self.assertEqual(self.names("default-user-settings"),
+                         ["default-user-settings-authorization", ai.POLICY_EMAIL_GUARD,
+                          ai.POLICY_DISPOSABLE])
+        self.assertEqual(self.names("stage-default-oobe-password"), [])
+        self.assertEqual(guard_before, next(p for p in self.st["expr_policies"]
+                                            if p["name"] == ai.POLICY_EMAIL_GUARD)["expression"])
+        text, _, _ = ai.load_disposable()
+        disp = next(p for p in self.st["expr_policies"] if p["name"] == ai.POLICY_DISPOSABLE)
+        self.assertIn(text, disp["expression"])
+        self.assertEqual((self.st["reputation_policies"], self.st["captcha_stages"]), ([], []))
+        # undo antibot alone: the guard stays where trust put it
+        trust_log, antibot_log = self.logs()
+        self.assertTrue(antibot_log.endswith("-antibot.json"))
+        self.rollback(antibot_log)
+        self.assertEqual(self.names("self-registration-prompt"), [ai.POLICY_EMAIL_GUARD])
+        self.assertEqual({p["name"] for p in self.st["expr_policies"]},
+                         {"default-user-settings-authorization", ai.POLICY_EMAIL_GUARD})
+        self.rollback(trust_log)
+        self.assertEqual(essence(self.st, self.files), essence(self.orig, FakeFiles()))
+
+    def test_rollback_ignores_the_order_authentik_returns(self):
+        rc, out = self.run_ab("--apply", "antibot")
+        self.assertEqual(rc, 0, out)
+        st = next(s for s in self.st["prompt_stages"] if s["name"] == "default-user-settings")
+        st["validation_policies"].reverse()
+        out = self.rollback(self.logs()[0])
+        self.assertNotIn("SKIPPED", out)
+        self.assertEqual(essence(self.st, self.files), essence(self.orig, FakeFiles()))
+
+    def test_pinned_site_gates_every_password_login_flow(self):
+        self.files.texts[SITE] = PINNED_SITE
+        plan = self.plan()
+        keys = [op.key for op in plan.ops]
+        self.assertEqual(plan.blockers(), [])
+        self.assertEqual(keys[:5], ["policy.wopr-signup-relay", "policy.wopr-signup-ip-limit",
+                                    "policy.wopr-disposable-email", "policy.wopr-reputation",
+                                    "policy.wopr-reputation-gate"])
+        gated = sorted(k.split("binding.repgate.", 1)[1] for k in keys
+                       if k.startswith("binding.repgate."))
+        self.assertEqual(gated, ["brainjoos-authentication", "default-authentication-flow"])
+        for slug in gated:
+            self.assertLess(keys.index(f"flow.{slug}.mode"), keys.index(f"binding.repgate.{slug}"))
+        ops = {op.key: op for op in plan.ops}
+        self.assertEqual(ops["policy.wopr-reputation"].body,
+                         {"name": "wopr-reputation", "execution_logging": False, "check_ip": True,
+                          "check_username": False, "threshold": -5})
+        bind = ops["binding.repgate.default-authentication-flow"].body
+        self.assertEqual((bind["target"], bind["failure_result"], bind["negate"]),
+                         (F_AUTH, True, False))
+        self.assertIn("wopr-reputation-gate", ai.show(
+            ops["stage.self-registration-prompt.antibot"].body))
+        rc, out = self.run_ab("--apply", "antibot")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Verified: a fresh read-only plan", out)
+        rc, out = self.run_ab("--apply", "antibot")
+        self.assertIn("Nothing to do", out)
+        modes = {f["slug"]: f["policy_engine_mode"] for f in self.st["flows"]
+                 if f.get("policy_engine_mode")}
+        self.assertEqual(modes, {"self-registration": "any", "default-authentication-flow": "all",
+                                 "brainjoos-authentication": "all"})
+        self.assertEqual(self.names("self-registration-prompt"),
+                         [ai.POLICY_DISPOSABLE, ai.POLICY_SIGNUP_IP, ai.POLICY_REPUTATION_GATE])
+        self.rollback(self.logs()[0])
+        self.assertEqual(essence(self.st, self.files), essence(self.orig, FakeFiles()))
+
+    def test_unpinned_site_never_binds_the_gate(self):
+        for text in (None, UNPINNED_SITE):
+            if text is not None:
+                self.files.texts[SITE] = text
+            plan = self.plan()
+            keys = [op.key for op in plan.ops]
+            self.assertFalse([k for k in keys if "reputation" in k or "repgate" in k], keys)
+            self.assertTrue(any(lvl == "WARN" and "X-Forwarded-For" in m for lvl, m in plan.checks))
+
+    def test_login_flow_with_other_flow_bindings_is_left_alone(self):
+        self.files.texts[SITE] = PINNED_SITE
+        self.st["policy_bindings"].append({"pk": str(uuid.uuid4()), "target": F_BRAIN,
+                                           "group": G_ADMINS, "policy": None, "user": None,
+                                           "order": 0})
+        plan = self.plan()
+        keys = [op.key for op in plan.ops]
+        self.assertNotIn("binding.repgate.brainjoos-authentication", keys)
+        self.assertNotIn("flow.brainjoos-authentication.mode", keys)
+        self.assertIn("binding.repgate.default-authentication-flow", keys)
+        self.assertTrue(any(lvl == "WARN" and "NOT bound" in m for lvl, m in plan.checks))
+
+    def test_captcha_is_planned_only_when_the_keys_exist(self):
+        ready = ["--lovejoos-relay-ready"]
+        plan = self.plan(ready)
+        self.assertFalse([op for op in plan.ops if "captcha" in op.key])
+        self.assertTrue(any(m.startswith("captcha off: no Turnstile keys in Infisical")
+                            for _, m in plan.checks))
+        half = FakeInfisical({"TURNSTILE_SITE_KEY": TS_SITE})
+        plan = self.plan(ready, half)
+        self.assertFalse([op for op in plan.ops if "captcha" in op.key])
+        self.assertTrue(any("TURNSTILE_SECRET_KEY not found" in m for _, m in plan.checks))
+        plan = self.plan((), FakeInfisical(TS_KEYS))  # keys, but LoveJoos not ready
+        self.assertFalse([op for op in plan.ops if "captcha" in op.key])
+        self.assertTrue(any(lvl == "WARN" and m.startswith("captcha held back")
+                            for lvl, m in plan.checks))
+        inf = FakeInfisical(TS_KEYS)
+        plan = self.plan(ready, inf)
+        self.assertEqual(plan.blockers(), [])
+        self.assertEqual([op.key for op in plan.ops][-3:],
+                         ["stage.captcha", "fsb.captcha", "binding.captcha_relay_skip"])
+        ops = {op.key: op for op in plan.ops}
+        fsb = ops["fsb.captcha"].body
+        self.assertEqual((fsb["target"], fsb["order"]), (F_SELFREG, 15))
+        skip = ops["binding.captcha_relay_skip"].body
+        self.assertEqual((skip["negate"], skip["failure_result"]), (True, True))
+        self.assertEqual(skip["policy"], ai.Ref("policy.wopr-signup-relay", ""))
+        self.assertEqual(inf.value_reads, [])  # planning a new stage reads no secret
+
+    def test_infisical_unreadable_means_captcha_off_and_still_passes(self):
+        rc, out = self.run_ab("--dry-run", "--phase", "antibot", "--lovejoos-relay-ready",
+                              infisical=FakeInfisical(broken=True))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("captcha off: Infisical could not be read", out)
+        self.assertNotIn("APPLY WOULD BE REFUSED", out)
+
+    def test_captcha_apply_keeps_the_secret_out_of_output_and_logs(self):
+        inf = FakeInfisical(TS_KEYS)
+        rc, out = self.run_ab("--apply", "trust", infisical=inf)
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_ab("--apply", "antibot", "--lovejoos-relay-ready", infisical=inf)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Verified: a fresh read-only plan", out)
+        self.assertNotIn(TS_SECRET, out)
+        self.assertIn("<TURNSTILE_SECRET_KEY from Infisical, not shown>", out)
+        for path in self.logs():
+            with open(path) as fh:
+                self.assertNotIn(TS_SECRET, fh.read())
+        cap = self.st["captcha_stages"][0]
+        self.assertEqual((cap["public_key"], cap["private_key"]), (TS_SITE, TS_SECRET))
+        self.assertEqual({k: cap[k] for k in ai.TURNSTILE_ATTRS}, ai.TURNSTILE_ATTRS)
+        orders = {b["stage_obj"]["name"]: b["order"] for b in self.st["flow_bindings"]
+                  if b["target"] == F_SELFREG}
+        self.assertEqual(orders, {"self-registration-prompt": 10, "wopr-turnstile": 15,
+                                  "self-registration-write": 20,
+                                  "self-registration-email-verification": 25,
+                                  "self-registration-login": 30})
+        fsb = next(b for b in self.st["flow_bindings"] if b["stage"] == cap["pk"])
+        relay = next(p for p in self.st["expr_policies"] if p["name"] == ai.POLICY_RELAY)
+        skip = [b for b in self.st["policy_bindings"] if b["target"] == fsb["pk"]]
+        self.assertEqual([(b["policy"], b["negate"], b["failure_result"]) for b in skip],
+                         [(relay["pk"], True, True)])
+        rc, out = self.run_ab("--apply", "antibot", "--lovejoos-relay-ready", infisical=inf)
+        self.assertIn("Nothing to do", out)
+        rotated = FakeInfisical({**TS_KEYS, "TURNSTILE_SITE_KEY": "rotated-site-key"})
+        rc, out = self.run_ab("--apply", "antibot", "--lovejoos-relay-ready", infisical=rotated)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("another site key", out)
+        for path in reversed(self.logs()):
+            self.rollback(path)
+        self.assertEqual(essence(self.st, self.files), essence(self.orig, FakeFiles()))
+
+    def test_tampered_list_blocks_the_phase(self):
+        bad = os.path.join(self.tmp, "list.txt")
+        with open(ai.DISPOSABLE_FILE, "rb") as fh:
+            data = fh.read()
+        with open(bad, "wb") as fh:
+            fh.write(data + b"gmail.com\n")
+        old, ai.DISPOSABLE_FILE = ai.DISPOSABLE_FILE, bad
+        try:
+            plan = self.plan()
+        finally:
+            ai.DISPOSABLE_FILE = old
+        self.assertTrue(any("sha256" in b for b in plan.blockers()))
+        self.assertNotIn("policy.wopr-disposable-email", [op.key for op in plan.ops])
+
+    def test_vendored_list_is_byte_for_byte_and_pinned(self):
+        text, domains, commit = ai.load_disposable()
+        self.assertEqual((len(domains), commit), (9205, ai.DISPOSABLE_COMMIT))
+        with open(ai.DISPOSABLE_FILE, "rb") as fh:
+            raw = fh.read()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), ai.DISPOSABLE_SHA256)
+        self.assertNotIn(b"\r", raw)
+        for name in ("gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com",
+                     "proton.me", "wopr.systems", "yourspace.you", "lovejoos.com",
+                     "barterra.store"):
+            self.assertNotIn(name, domains)
+
+    def test_existing_throwaway_accounts_are_reported_not_changed(self):
+        self.st["users"].append({"pk": 70, "username": "old", "name": "", "type": "internal",
+                                 "email": "old@sub.mailinator.com", "path": "users",
+                                 "is_active": True, "groups": [], "roles": [], "attributes": {},
+                                 "uid": "u70"})
+        plan = self.plan()
+        self.assertTrue(any("1 existing account(s) already use a throwaway domain" in m
+                            and "ol***@sub.mailinator.com" in m for _, m in plan.checks))
+        self.assertFalse([op for op in plan.ops if op.path[0].startswith("/core/users/")])
+
+
+class CaddyCheckTests(unittest.TestCase):
+    def test_xff_pin_detection(self):
+        self.assertEqual(ai.caddy_xff_pinned(PINNED_SITE),
+                         (True, "2 of 2 reverse_proxy block(s) pin X-Forwarded-For to the real "
+                                "client"))
+        self.assertFalse(ai.caddy_xff_pinned(UNPINNED_SITE)[0])
+        one = PINNED_SITE.replace("            header_up X-Forwarded-For {client_ip}\n", "", 1)
+        self.assertEqual(ai.caddy_xff_pinned(one)[0], False)
+        self.assertIn("1 of 2", ai.caddy_xff_pinned(one)[1])
+        cf = PINNED_SITE.replace("{client_ip}", "{http.request.header.CF-Connecting-IP}")
+        self.assertTrue(ai.caddy_xff_pinned(cf)[0])
+        commented = PINNED_SITE.replace("header_up X-Forwarded-For", "# header_up X-Forwarded-For")
+        self.assertFalse(ai.caddy_xff_pinned(commented)[0])
+        spoofable = PINNED_SITE.replace("{client_ip}", "{http.request.header.X-Forwarded-For}")
+        self.assertFalse(ai.caddy_xff_pinned(spoofable)[0])
+        self.assertEqual(ai.caddy_xff_pinned(None), (False, "could not be read"))
+        self.assertFalse(ai.caddy_xff_pinned("http://x:18080 {\n respond 404\n}\n")[0])
+
+
+class AllowlistTests(unittest.TestCase):
+    """Every call any phase plans (and every undo) is in SCHEMA_USES, the list --check-schema
+    checks against the live authentik."""
+
+    def setUp(self):
+        self.uses = []
+        for method, path, fields in ai.SCHEMA_USES:
+            rx = "^" + "[^/]+".join(re.escape(x) for x in re.split(r"\{[^}]+\}", path)) + "$"
+            self.uses.append((method.upper(), re.compile(rx), set(fields)))
+
+    def check(self, method, path, body, what):
+        if method in ("TOKEN_FILE", "REMOVE_FILE"):
+            return
+        hits = [u for u in self.uses if u[0] == method and u[1].match(path)]
+        self.assertTrue(hits, f"{what}: {method} {path} is not in SCHEMA_USES")
+        if isinstance(body, dict) and method in ("POST", "PATCH"):
+            self.assertTrue(any(set(body) <= u[2] for u in hits),
+                            f"{what}: {method} {path} sends {sorted(body)}")
+
+    def check_all(self, st):
+        files = FakeFiles()
+        files.texts[SITE] = PINNED_SITE
+        o = ai.build_parser().parse_args(["--lovejoos-relay-ready", "--lovejoos-release-deployed",
+                                          "--no-lovejoos-export"])
+        o.files, o.infisical = files, FakeInfisical(TS_KEYS)
+        seen = 0
+        for phase in ai.PHASES:
+            plan = ai.PLANNERS[phase](ai.Snapshot(FakeApi(st), o), o)
+            for op in plan.ops:
+                seen += 1
+                self.check(op.method, ai.show_path(op.path), op.body, op.key)
+                if op.inverse:
+                    self.check(op.inverse["method"], ai.show_path(op.inverse["path"]),
+                               op.inverse.get("body"), op.key + " (undo)")
+        return seen
+
+    def test_fresh_fixture(self):
+        self.assertGreater(self.check_all(fixture()), 40)
+
+    def test_drifted_antibot_objects(self):
+        st = fixture()
+        st["expr_policies"].append({"pk": str(uuid.uuid4()), "name": ai.POLICY_RELAY,
+                                    "expression": "return False"})
+        st["reputation_policies"].append({"pk": str(uuid.uuid4()), "name": ai.POLICY_REPUTATION,
+                                          "check_ip": False, "check_username": True,
+                                          "threshold": -5})
+        st["captcha_stages"].append({"pk": str(uuid.uuid4()), "name": ai.CAPTCHA_STAGE,
+                                     "public_key": TS_SITE, "js_url": "https://x.example/api.js",
+                                     "api_url": ai.TURNSTILE_ATTRS["api_url"],
+                                     "interactive": False, "error_on_invalid_score": True})
+        self.assertGreater(self.check_all(st), 40)
+
+
+class AntibotExpressionTests(unittest.TestCase):
+    run_expr = ExpressionTests.run_expr
+
+    # -- wopr-disposable-email
+    def test_disposable_email(self):
+        text, domains, commit = ai.load_disposable()
+        E, shown = ai.disposable_expression(text, len(domains), commit)
+        anon = types.SimpleNamespace(is_authenticated=False, pk=None)
+
+        def check(email, user=anon):
+            return self.run_expr(E, types.SimpleNamespace(user=user,
+                                                          context={"prompt_data": {"email": email}}))
+
+        refused = ("bot@mailinator.com", " Bot@MAILINATOR.com ", "x@yopmail.com", "x@0-mail.com",
+                   "x@mailinator.com.", f"x@{domains[-1]}",
+                   # parent domains: any subdomain of a listed domain
+                   "x@inbox.mailinator.com", "x@a.b.yopmail.com", "x@deep.0-mailer.dynv6.net")
+        for email in refused:
+            ok, msgs = check(email)
+            self.assertFalse(ok, email)
+            self.assertEqual(msgs, [DISPOSABLE_MSG], email)
+        allowed = ("scott@gmail.com", "a@googlemail.com", "a@outlook.com", "a@hotmail.com",
+                   "a@yahoo.com", "a@icloud.com", "a@proton.me", "a@protonmail.com",
+                   "a@fastmail.com", "a@wopr.systems", "a@yourspace.you", "a@lovejoos.com",
+                   "a@example.org",
+                   # a listed name that is not the domain or a parent of it
+                   "a@woprmailinator.com", "a@notyopmail.com", "a@yopmail.com.example.org",
+                   # the parent of a listed subdomain is not itself listed
+                   "a@dynv6.net")
+        for email in allowed:
+            ok, msgs = check(email)
+            self.assertTrue(ok, email)
+            self.assertEqual(msgs, [], email)
+        for data in ({}, {"email": ""}, {"email": "no-at-sign"}, {"username": "x"}):
+            req = types.SimpleNamespace(user=anon, context={"prompt_data": data})
+            self.assertTrue(self.run_expr(E, req)[0], data)
+        self.assertTrue(self.run_expr(E, types.SimpleNamespace(user=anon, context={}))[0])
+        # a signed-in user keeps the address they have, but cannot move to a throwaway one
+        old = FakeUser(60, "Old@Mailinator.com")
+        self.assertTrue(check("old@mailinator.com", old)[0])
+        self.assertFalse(check("new@yopmail.com", old)[0])
+        self.assertFalse(check("new@yopmail.com", FakeUser(61, "me@gmail.com"))[0])
+        # authentik's anonymous user is a User row (authenticated, no email): still checked
+        self.assertFalse(check("x@mailinator.com", FakeUser(1, ""))[0])
+        # the policy holds the whole list; the printed version does not
+        self.assertIn(text, E)
+        self.assertIn(ai.DISPOSABLE_COMMIT, E)
+        self.assertIn(ai.DISPOSABLE_SHA256, E)
+        self.assertIn(DISPOSABLE_MSG, E)
+        self.assertNotIn("mailinator", shown)
+        self.assertIn("9205 domains", shown)
+
+    # -- wopr-signup-ip-limit
+    def ip_limit(self, client, rows, relay=False):
+        calls = []
+
+        def ak_call_policy(name):
+            calls.append(name)
+            return types.SimpleNamespace(passing=relay and name == ai.POLICY_RELAY)
+
+        tz = types.ModuleType("django.utils.timezone")
+        tz.now = lambda: datetime.now(timezone.utc)
+        mods = {"django": types.ModuleType("django"), "django.utils": types.ModuleType("django.utils"),
+                "django.utils.timezone": tz,
+                "authentik.events": types.ModuleType("authentik.events"),
+                "authentik.events.models": events_module(rows)}
+        req = types.SimpleNamespace(context={"prompt_data": {"email": "x@example.org"}},
+                                    http_request=None)
+        ok, msgs = self.run_expr(ai.SIGNUP_IP_EXPR, req, modules=mods,
+                                 ak_client_ip=ipaddress.ip_address(client),
+                                 ak_call_policy=ak_call_policy)
+        return ok, msgs, calls
+
+    def test_signup_ip_limit(self):
+        now = datetime.now(timezone.utc)
+
+        def ev(ip, hours=1.0, created=True, action="user_write"):
+            return {"action": action, "client_ip": ip, "created": now - timedelta(hours=hours),
+                    "context": {"created": created}}
+
+        A, B = "8.8.8.8", "1.1.1.1"
+        # the boundary: 2 sign-ups in 24h -> the 3rd goes through; 3 -> the 4th is refused
+        ok, msgs, calls = self.ip_limit(A, [ev(A), ev(A, 23.9)])
+        self.assertTrue(ok, msgs)
+        self.assertEqual(calls, [ai.POLICY_RELAY])
+        ok, msgs, _ = self.ip_limit(A, [ev(A), ev(A, 5), ev(A, 23.9)])
+        self.assertFalse(ok)
+        self.assertEqual(msgs, [IP_LIMIT_MSG])
+        # what does not count: older than 24h, not a new account, another IP or action, no IP
+        noise = [ev(A, 24.1), ev(A, 48), ev(A, created=False), ev(B), ev(B), ev(B),
+                 ev(A, action="login"), ev(None), ev("not-an-ip")]
+        self.assertTrue(self.ip_limit(A, [ev(A), ev(A)] + noise)[0])
+        self.assertFalse(self.ip_limit(B, [ev(A), ev(A)] + noise)[0])
+        # IPv6 counts per /64
+        V = "2606:4700:4700::1111"
+        same64 = ["2606:4700:4700::1001", "2606:4700:4700::64", "2606:4700:4700:0:1::5"]
+        self.assertFalse(self.ip_limit(V, [ev(x) for x in same64])[0])
+        other64 = ["2606:4700:4700:1::1", "2606:4700:4700:2::1", "2606:4700:4701::1"]
+        self.assertTrue(self.ip_limit(V, [ev(x) for x in other64])[0])
+        # an IPv4-mapped client is that IPv4 client
+        self.assertFalse(self.ip_limit("::ffff:8.8.8.8", [ev(A)] * 3)[0])
+        # exemption 1: LoveJoos's relay proof
+        ok, msgs, calls = self.ip_limit(A, [ev(A)] * 5, relay=True)
+        self.assertTrue(ok, msgs)
+        self.assertEqual(calls, [ai.POLICY_RELAY])
+        # exemption 2: callers inside the Rig (not a public address), relay not even asked
+        for inside in ("172.19.0.7", "10.0.0.3", "127.0.0.1", "192.168.0.250",
+                       "255.255.255.255", "::1", "fd00::5"):
+            ok, msgs, calls = self.ip_limit(inside, [ev(inside)] * 5)
+            self.assertTrue(ok, inside)
+            self.assertEqual(calls, [], inside)
+        E = ai.SIGNUP_IP_EXPR
+        self.assertIn(f"LIMIT = {ai.SIGNUP_IP_LIMIT}\n", E)
+        self.assertIn(f"WINDOW = timedelta(hours={ai.SIGNUP_IP_WINDOW_HOURS})\n", E)
+        self.assertIn(f'ak_call_policy("{ai.POLICY_RELAY}")', E)
+
+    # -- wopr-signup-relay
+    KEY = "k" * 32 + "Z" * 32
+
+    def relay(self, headers, token, http=True):
+        lookups = []
+
+        class QS:
+            def select_related(self, *_):
+                return self
+
+            def first(self):
+                return token
+
+        class Token:
+            @staticmethod
+            def filter_not_expired(**kw):
+                lookups.append(kw)
+                return QS()
+
+        core = types.ModuleType("authentik.core.models")
+        core.Token, core.TokenIntents = Token, types.SimpleNamespace(INTENT_API="api")
+        req = types.SimpleNamespace(
+            context={}, http_request=types.SimpleNamespace(headers=headers) if http else None)
+        ok, _ = self.run_expr(ai.RELAY_EXPR, req, modules={"authentik.core.models": core})
+        return ok, lookups
+
+    def test_relay_proof(self):
+        sa = types.SimpleNamespace(username=ai.LJ_SA_USERNAME, is_active=True)
+        good = types.SimpleNamespace(key=self.KEY, user=sa)
+        ok, lookups = self.relay({ai.RELAY_HEADER: self.KEY}, good)
+        self.assertTrue(ok)
+        self.assertEqual(lookups, [{"identifier": ai.LJ_TOKEN_ID, "intent": "api"}])
+        self.assertTrue(self.relay({ai.RELAY_HEADER: f" {self.KEY} "}, good)[0])
+        for headers in ({}, {ai.RELAY_HEADER: ""}, {ai.RELAY_HEADER: self.KEY[:-1] + "X"},
+                        {ai.RELAY_HEADER: self.KEY + "X"}, {"X-Other": self.KEY},
+                        {"Authorization": "Bearer " + self.KEY}):
+            self.assertFalse(self.relay(headers, good)[0], headers)
+        self.assertEqual(self.relay({}, good)[1], [])  # no header: no token lookup at all
+        other = types.SimpleNamespace(key=self.KEY, user=types.SimpleNamespace(
+            username="akadmin", is_active=True))
+        off = types.SimpleNamespace(key=self.KEY, user=types.SimpleNamespace(
+            username=ai.LJ_SA_USERNAME, is_active=False))
+        for token in (None, other, off):
+            self.assertFalse(self.relay({ai.RELAY_HEADER: self.KEY}, token)[0])
+        self.assertFalse(self.relay(None, good, http=False)[0])
+        for needle in (f'"{ai.RELAY_HEADER}"', f'identifier="{ai.LJ_TOKEN_ID}"',
+                       f'"{ai.LJ_SA_USERNAME}"'):
+            self.assertIn(needle, ai.RELAY_EXPR)
+
+    # -- wopr-reputation-gate
+    def gate(self, client, bad):
+        calls = []
+
+        def ak_call_policy(name):
+            calls.append(name)
+            return types.SimpleNamespace(passing=bad)
+
+        ok, msgs = self.run_expr(ai.REPUTATION_GATE_EXPR, types.SimpleNamespace(context={}),
+                                 ak_client_ip=ipaddress.ip_address(client),
+                                 ak_call_policy=ak_call_policy)
+        return ok, msgs, calls
+
+    def test_reputation_gate(self):
+        ok, msgs, calls = self.gate("8.8.8.8", bad=True)
+        self.assertFalse(ok)
+        self.assertEqual(calls, [ai.POLICY_REPUTATION])
+        self.assertIn("Reset your password", msgs[0])
+        self.assertTrue(self.gate("8.8.8.8", bad=False)[0])
+        self.assertTrue(self.gate("2606:4700:4700::1111", bad=False)[0])
+        for inside in ("172.19.0.7", "10.0.0.3", "127.0.0.1", "255.255.255.255"):
+            ok, msgs, calls = self.gate(inside, bad=True)
+            self.assertTrue(ok, inside)
+            self.assertEqual(calls, [], inside)
+
+    def test_expressions_compile_the_way_authentik_runs_them(self):
+        text, domains, commit = ai.load_disposable()
+        big, _ = ai.disposable_expression(text, len(domains), commit)
+        self.assertLess(len(big), 200_000)
+        ctx = "ak_message,ak_user_has_authenticator,ak_is_sso_flow,ak_client_ip,http_request," \
+              "request,context"
+        for name, expr in ((ai.POLICY_DISPOSABLE, big), (ai.POLICY_RELAY, ai.RELAY_EXPR),
+                           (ai.POLICY_SIGNUP_IP, ai.SIGNUP_IP_EXPR),
+                           (ai.POLICY_REPUTATION_GATE, ai.REPUTATION_GATE_EXPR)):
+            # authentik's BaseEvaluator.wrap_expression: indent() also indents the lines of
+            # the domain list inside its string; the policy splits on whitespace for that.
+            wrapped = (f"def handler({ctx}):\n" + textwrap.indent(expr, "    ")
+                       + f"\nresult = handler({ctx})")
+            t0 = time.perf_counter()
+            compile(wrapped, name, "exec")
+            self.assertLess(time.perf_counter() - t0, 0.5, name)
+
+
+def events_module(rows):
+    """authentik.events.models for wopr-signup-ip-limit: `rows` are user_write-like events."""
+    mod = types.ModuleType("authentik.events.models")
+
+    class QS:
+        def __init__(self, items):
+            self.items = items
+
+        def exclude(self, client_ip):
+            assert client_ip is None
+            return QS([r for r in self.items if r["client_ip"] is not None])
+
+        def values_list(self, field, flat=False):
+            assert flat
+            return [r[field] for r in self.items]
+
+    class Manager:
+        @staticmethod
+        def filter(action, context__created, created__gte):
+            return QS([r for r in rows if r["action"] == action
+                       and (r.get("context") or {}).get("created") == context__created
+                       and r["created"] >= created__gte])
+
+    mod.Event = type("Event", (), {"objects": Manager})
+    mod.EventAction = types.SimpleNamespace(USER_WRITE="user_write")
+    return mod
 
 
 if __name__ == "__main__":

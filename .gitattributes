@@ -1,0 +1,3 @@
+# The vendored list must stay byte for byte (sha256 pinned in apply_identity.py).
+abuse/disposable_domains.txt -text
+abuse/SOURCE_COMMIT -text
