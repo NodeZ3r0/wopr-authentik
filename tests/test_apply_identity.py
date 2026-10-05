@@ -291,6 +291,9 @@ class FakeApi:
                                                     "codename": p.split(".")[1],
                                                     "object_pk": obj} for p, m, obj in rp["object"]]})
             return out
+        if path == "/rbac/roles/" and "users" in params:
+            user = self._item("/core/users/", params["users"]) or {}
+            return [copy.deepcopy(r) for r in st["roles"] if r["pk"] in (user.get("roles") or [])]
         prefix, parts = self._split(path)
         if prefix is None:
             raise ai.ApiError("GET", path, 404, "no route")
@@ -691,6 +694,20 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual((self.st["tokens"][0]["expiring"], self.st["tokens"][0]["user"]),
                          (False, sa["pk"]))
 
+    def test_service_account_managed_role_is_left_alone(self):
+        self.apply("groups")
+        sa = next(u for u in self.st["users"] if u["username"] == ai.LJ_SA_USERNAME)
+        managed = {"pk": str(uuid.uuid4()), "name": f"ak-managed-role--user-{sa['pk']}"}
+        self.st["roles"].append(managed)
+        sa["roles"].append(managed["pk"])
+        rc, out = self.apply("groups")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Nothing to do", out)
+        sa["roles"].append("fe48ac3c-4d60-4686-85a2-a860bb6c2b0d")  # WOPR Read-only
+        rc, out = run(["--phase", "groups"], self.api, self.files)
+        self.assertIn("also holds role(s) WOPR Read-only", out)
+        self.assertIn("Planned changes: none", out)
+
     def test_dry_run_mode_cannot_write(self):
         api = FakeApi(fixture())
         with self.assertRaises(RuntimeError):
@@ -774,6 +791,9 @@ class ExpressionTests(unittest.TestCase):
         self.assertTrue(self.run_expr(E, self.req(bink, "fresh@example.org", True), users)[0])
         allowed = FakeUser(23, "sbinkerd1@gmail.com", can_change=True)
         self.assertTrue(self.run_expr(E, self.req(allowed, "fresh@example.org"), [allowed])[0])
+        no_http = types.SimpleNamespace(user=bink, context={"prompt_data": {"email": "x@y.org"}},
+                                        http_request=None)
+        self.assertFalse(self.run_expr(E, no_http, users)[0])
         noemail = FakeUser(32, "")
         self.assertTrue(self.run_expr(E, self.req(noemail, "fresh@example.org"), users)[0])
         self.assertTrue(self.run_expr(E, self.req(anon, has_email=False), users)[0])

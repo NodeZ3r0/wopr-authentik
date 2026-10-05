@@ -108,9 +108,8 @@ if others.exists():
 current = str(getattr(user, "email", "") or "").strip() if user_pk is not None else ""
 if current and current.lower() != email.lower():
     http_request = request.http_request
-    allowed = user.group_attributes(http_request).get(
-        USER_ATTRIBUTE_CHANGE_EMAIL, http_request.tenant.default_user_change_email
-    )
+    default = getattr(getattr(http_request, "tenant", None), "default_user_change_email", False)
+    allowed = user.group_attributes(http_request).get(USER_ATTRIBUTE_CHANGE_EMAIL, default)
     if not allowed:
         ak_message("Your email address can't be changed here.")
         return False
@@ -482,6 +481,8 @@ class Snapshot:
             self.lj_role_global = a("/rbac/permissions/", role=self.lj_role["pk"])
             self.lj_role_object = a("/rbac/permissions/roles/", uuid=self.lj_role["pk"])
         self.lj_tokens = a("/core/tokens/", identifier=LJ_TOKEN_ID)
+        sa = find(self.users, username=LJ_SA_USERNAME)
+        self.lj_sa_roles = a("/rbac/roles/", users=sa["pk"]) if sa else []
         verified = self.group(GROUP_VERIFIED)
         params = {"model": "authentik_core.group"}
         if verified:
@@ -503,8 +504,10 @@ class Snapshot:
                 if (e.get("user") or {}).get("pk") == BINK_PK]
             if barter.get("provider"):
                 for kind in ("refresh_tokens", "access_tokens"):
-                    self.bink_barter_tokens += a(f"/oauth2/{kind}/", user=BINK_PK,
-                                                 provider=barter["provider"])
+                    self.bink_barter_tokens += [
+                        t for t in a(f"/oauth2/{kind}/", user=BINK_PK, provider=barter["provider"])
+                        if (t.get("user") or {}).get("pk") == BINK_PK
+                        and (t.get("provider") or {}).get("pk") == barter["provider"]]
         self.oldest_event = ((g("/events/events/", ordering="created", page_size=1) or {})
                              .get("results") or [{}])[0].get("created")
 
@@ -1011,8 +1014,17 @@ def plan_groups(s: Snapshot, o) -> Plan:
             p.block(f"user '{LJ_SA_USERNAME}' exists but is type {sa.get('type')}, not a service "
                     "account")
         changes, before = {}, {}
-        if list(sa.get("roles") or []) != [role_ref]:
-            changes["roles"], before["roles"] = [role_ref], list(sa.get("roles") or [])
+        cur_roles = list(sa.get("roles") or [])
+        if role_ref not in cur_roles:
+            changes["roles"], before["roles"] = cur_roles + [role_ref], cur_roles
+        # authentik adds the account's own managed role (ak-managed-role--user-<pk>) when it
+        # creates a token for itself; anything else is reported, not removed.
+        own = f"ak-managed-role--user-{sa['pk']}"
+        extra = [r["name"] for r in s.lj_sa_roles
+                 if r["pk"] != (role["pk"] if role else None) and r["name"] != own]
+        if extra:
+            p.warn(f"service account '{LJ_SA_USERNAME}' also holds role(s) {', '.join(extra)}; "
+                   "review them (not changed here)")
         if sa.get("groups"):
             changes["groups"], before["groups"] = [], list(sa["groups"])
         if not sa.get("is_active"):
