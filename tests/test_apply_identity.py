@@ -576,7 +576,8 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual((bink["username"], bink["name"]), ("bink", "BINK"))
         self.assertEqual(bink["attributes"]["yourspace"], ai.BINK_YOURSPACE)
         self.assertEqual(bink["attributes"]["access_code"], "kept-secret-ish")
-        self.assertIn(23, names["wopr-verified"]["users"])
+        # only the control-plane sync writes wopr-verified
+        self.assertNotIn(23, names["wopr-verified"]["users"])
         self.assertIn(23, names["yourspace-members"]["users"])
         # gate: ljfan (export) + nodez3r0 (authorize event) in; BINK stays out
         self.assertEqual(sorted(names["lovejoos-users"]["users"]), [7, 40])

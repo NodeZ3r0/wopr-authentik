@@ -1399,10 +1399,16 @@ def plan_bink(s: Snapshot, o) -> Plan:
                  show_body=shown, show_inverse=shown_inv))
     else:
         p.ok(f"pk {BINK_PK} already is bink / BINK with the yourspace attribute")
-    for name, why in ((GROUP_YOURSPACE, "he has a YourSpace server"),
-                      (GROUP_VERIFIED, "he has a paid YourSpace subscription; the control-plane "
-                                       "sync keeps him there only if it sees that subscription "
-                                       "on the account linked to this uid")):
+    # wopr-verified is NOT written here: the control-plane paid-status sync is its only
+    # writer (contract IDENTITY-GROUPS / VERIFIED-BADGE). It finds BINK by his paid
+    # subscription's email; a comped BINK needs a grant in its overrides file instead.
+    verified = s.group(GROUP_VERIFIED)
+    if verified and BINK_PK in (verified.get("users") or []):
+        p.ok(f"pk {BINK_PK} is in {GROUP_VERIFIED} (kept there by the control-plane sync)")
+    else:
+        p.info(f"pk {BINK_PK} is not in {GROUP_VERIFIED} yet; the control-plane paid-status "
+               "sync adds him from his paid subscription (this phase never writes that group)")
+    for name, why in ((GROUP_YOURSPACE, "he has a YourSpace server"),):
         grp = s.group(name)
         gref = grp["pk"] if grp else external_ref("group", name, "groups")
         if grp and BINK_PK in (grp.get("users") or []):
