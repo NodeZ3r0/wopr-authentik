@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import types
+from datetime import datetime, timedelta, timezone
 import unittest
 import uuid
 
@@ -105,7 +106,8 @@ def fixture():
         "email_templates": [{"name": "email/password_reset.html"},
                             {"name": "email/account_confirmation.html"}],
         "user_write_stages": [{"pk": S_SELFREG_WRITE, "name": "self-registration-write",
-                               "create_users_as_inactive": False, "create_users_group": None}],
+                               "create_users_as_inactive": False, "create_users_group": None,
+                               "user_path_template": ""}],
         "ident_stages": [{"pk": S_IDENT, "name": "default-authentication-identification",
                           "enrollment_flow": F_SELFREG, "user_fields": ["email", "username"],
                           "sources": []}],
@@ -542,6 +544,7 @@ class ApplyTests(unittest.TestCase):
             want = s["name"] in ai.REQUIRED_EMAIL_STAGES
             self.assertEqual(guard in s["validation_policies"], want, s["name"])
         self.assertTrue(st["user_write_stages"][0]["create_users_as_inactive"])
+        self.assertEqual(st["user_write_stages"][0]["user_path_template"], ai.SELF_REG_PATH)
         self.assertEqual({s["user_matching_mode"] for s in st["oauth_sources"]}, {"email_deny"})
         # groups
         names = {g["name"]: g for g in st["groups"]}
@@ -727,11 +730,22 @@ class FakeQS:
     def exists(self):
         return bool(self.users)
 
+    def __iter__(self):
+        return iter(list(self.users))
+
 
 class FakeUser:
-    def __init__(self, pk, email, can_change=None):
+    def __init__(self, pk, email, can_change=None, path="users", is_active=True,
+                 last_login="2026-01-01", joined_hours_ago=1000, store=None):
         self.pk, self.email, self.is_authenticated = pk, email, True
+        self.username = f"u{pk}"
         self._attrs = {} if can_change is None else {"goauthentik.io/user/can-change-email": can_change}
+        self.path, self.is_active, self.last_login = path, is_active, last_login
+        self.date_joined = datetime.now(timezone.utc) - timedelta(hours=joined_hours_ago)
+        self._store = store
+
+    def delete(self):
+        self._store.remove(self)
 
     def group_attributes(self, _req):
         return self._attrs
@@ -755,10 +769,12 @@ class ExpressionTests(unittest.TestCase):
         old = {k: sys.modules.get(k) for k in mods}
         sys.modules.update(mods)
         try:
-            src = "def _f(request, ak_message):\n" + textwrap.indent(expr, "    ")
+            src = "def _f(request, ak_message, ak_logger):\n" + textwrap.indent(expr, "    ")
             g = {}
             exec(compile(src, "expr", "exec"), g)
-            return g["_f"](request, msgs.append), msgs
+            log = types.SimpleNamespace(
+                info=lambda *a, **k: self.__dict__.setdefault("logged", []).append((a, k)))
+            return g["_f"](request, msgs.append, log), msgs
         finally:
             for k, v in old.items():
                 if v is None:
@@ -798,6 +814,41 @@ class ExpressionTests(unittest.TestCase):
         self.assertTrue(self.run_expr(E, self.req(noemail, "fresh@example.org"), users)[0])
         self.assertTrue(self.run_expr(E, self.req(anon, has_email=False), users)[0])
         self.assertTrue(self.run_expr(E, self.req(anon, ""), users)[0])
+
+    def test_email_guard_frees_only_an_abandoned_signup(self):
+        self.logged = []
+        anon = types.SimpleNamespace(is_authenticated=False, pk=None)
+        E = ai.EMAIL_GUARD_EXPR
+        self.assertIn(f'SELF_REG_PATH = "{ai.SELF_REG_PATH}"', E)
+        self.assertIn(f"timedelta(hours={ai.ABANDONED_AFTER_HOURS})", E)
+        users = []
+        sr = dict(path=ai.SELF_REG_PATH, is_active=False, last_login=None, store=users)
+        users.append(FakeUser(50, "gone@example.org", joined_hours_ago=30, **sr))
+        ok, msgs = self.run_expr(E, self.req(anon, "Gone@example.org"), users)
+        self.assertTrue(ok, msgs)
+        self.assertEqual(users, [])
+        self.assertEqual(len(self.logged), 1)
+        # still inside its link's lifetime: kept, and the message says why
+        users.append(FakeUser(51, "fresh@example.org", joined_hours_ago=3, **sr))
+        ok, msgs = self.run_expr(E, self.req(anon, "fresh@example.org"), users)
+        self.assertFalse(ok)
+        self.assertIn("waiting to be confirmed", msgs[0])
+        self.assertEqual([u.pk for u in users], [51])
+        # never deleted: signed in once, active, made some other way, or another holder
+        keep = [
+            FakeUser(60, "a@example.org", path=ai.SELF_REG_PATH, is_active=False,
+                     last_login="2026-05-01", joined_hours_ago=900, store=users),
+            FakeUser(61, "b@example.org", path=ai.SELF_REG_PATH, is_active=True, last_login=None,
+                     joined_hours_ago=900, store=users),
+            FakeUser(62, "c@example.org", path="users", is_active=False, last_login=None,
+                     joined_hours_ago=900, store=users),
+        ]
+        users.extend(keep)
+        for u in keep:
+            ok, msgs = self.run_expr(E, self.req(anon, u.email), users)
+            self.assertFalse(ok, u.pk)
+            self.assertIn("already used by another account", msgs[0])
+        self.assertEqual(sorted(u.pk for u in users), [51, 60, 61, 62])
 
     def test_pkce_policy(self):
         def ctx(**kw):

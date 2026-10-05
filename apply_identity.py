@@ -65,6 +65,13 @@ POLICY_EMAIL_GUARD = "wopr-email-guard"
 POLICY_SIGNUP_CLOSED = "wopr-signup-closed"
 SELF_REG_FLOW = "self-registration"
 SELF_REG_WRITE = "self-registration-write"
+# New sign-ups live under this path, so the email guard can tell an abandoned
+# (never confirmed) sign-up from every other inactive account.
+SELF_REG_PATH = "users/self-registration"
+# The confirmation link lasts 24h (EMAIL_STAGE_ATTRS); an hour of grace after that.
+ABANDONED_AFTER_HOURS = 25
+EMAIL_GUARD_NOTE = ("the email guard frees an address only from an abandoned, never-confirmed "
+                    "sign-up on that path")
 EMAIL_STAGE = "self-registration-email-verification"
 EMAIL_TEMPLATE = "email/account_confirmation.html"
 EMAIL_STAGE_ATTRS = {
@@ -88,8 +95,17 @@ EMAIL_GUARD_EXPR = '''\
 # Validation policy on every prompt stage that writes "email":
 #  1. one account per email address (case-insensitive);
 #  2. a signed-in user may not change an existing email here unless authentik's own
-#     email-change setting allows it (same rule as default-user-settings-authorization).
+#     email-change setting allows it (same rule as default-user-settings-authorization);
+#  3. an abandoned sign-up does not hold its address forever. The confirmation link
+#     cannot be re-sent, so an account that came from self-registration (path
+#     users/self-registration), was never confirmed (inactive, never signed in) and is
+#     older than its link (24h) plus an hour is deleted when the address is used again.
+#     Nothing else is ever deleted here.
+from datetime import datetime, timedelta, timezone
 from authentik.core.models import USER_ATTRIBUTE_CHANGE_EMAIL, User
+
+SELF_REG_PATH = "users/self-registration"
+ABANDONED_AFTER = timedelta(hours=25)
 
 prompt_data = request.context.get("prompt_data") or {}
 if "email" not in prompt_data:
@@ -99,11 +115,28 @@ if not email:
     return True
 user = request.user
 user_pk = getattr(user, "pk", None) if getattr(user, "is_authenticated", False) else None
-others = User.objects.filter(email__iexact=email)
-if user_pk is not None:
-    others = others.exclude(pk=user_pk)
+def holders():
+    qs = User.objects.filter(email__iexact=email)
+    return qs.exclude(pk=user_pk) if user_pk is not None else qs
+
+def unconfirmed(u):
+    return (getattr(u, "path", "") == SELF_REG_PATH and not getattr(u, "is_active", True)
+            and getattr(u, "last_login", None) is None)
+
+cutoff = datetime.now(timezone.utc) - ABANDONED_AFTER
+for old in list(holders()):
+    joined = getattr(old, "date_joined", None)
+    if unconfirmed(old) and joined is not None and joined < cutoff:
+        ak_logger.info("wopr-email-guard: deleting an abandoned sign-up to free its address",
+                       user=getattr(old, "username", ""), joined=str(joined))
+        old.delete()
+others = holders()
 if others.exists():
-    ak_message("This email address is already used by another account.")
+    if all(unconfirmed(u) for u in others):
+        ak_message("This address has a sign-up waiting to be confirmed. Use the link we "
+                   "emailed (it works for 24 hours), or try again after that.")
+    else:
+        ak_message("This email address is already used by another account.")
     return False
 current = str(getattr(user, "email", "") or "").strip() if user_pk is not None else ""
 if current and current.lower() != email.lower():
@@ -782,6 +815,16 @@ def plan_trust(s: Snapshot, o) -> Plan:
                                  {"create_users_as_inactive": False})))
         else:
             p.ok(f"'{SELF_REG_WRITE}' already creates users inactive")
+        if (write.get("user_path_template") or "") != SELF_REG_PATH:
+            was = write.get("user_path_template") or ""
+            p.add(Op("stage.write.path", f"'{SELF_REG_WRITE}': put new sign-ups under path "
+                     f"'{SELF_REG_PATH}' ({EMAIL_GUARD_NOTE})", "PATCH",
+                     ("/stages/user_write/", write["pk"], "/"), {"user_path_template": SELF_REG_PATH},
+                     before={"user_path_template": was},
+                     inverse=inv("PATCH", ("/stages/user_write/", write["pk"], "/"),
+                                 {"user_path_template": was})))
+        else:
+            p.ok(f"'{SELF_REG_WRITE}' already puts new sign-ups under '{SELF_REG_PATH}'")
     else:  # close
         deny = ensure_expression_policy(p, s, POLICY_SIGNUP_CLOSED, SIGNUP_CLOSED_EXPR,
                                         "refuses the self-registration flow")
@@ -1590,7 +1633,7 @@ SCHEMA_USES = [
     ("patch", "/stages/email/{stage_uuid}/", ("template",)),
     ("delete", "/stages/email/{stage_uuid}/", ()),
     ("get", "/stages/user_write/", ()),
-    ("patch", "/stages/user_write/{stage_uuid}/", ("create_users_as_inactive",)),
+    ("patch", "/stages/user_write/{stage_uuid}/", ("create_users_as_inactive", "user_path_template")),
     ("get", "/stages/identification/", ()),
     ("patch", "/stages/identification/{stage_uuid}/", ("enrollment_flow", "user_fields", "sources")),
     ("get", "/policies/expression/", ()),
