@@ -374,6 +374,8 @@ class FakeApi:
         if prefix is None:
             raise ai.ApiError(method, path, 404, "no route")
         key, idf, kind = self.COLL[prefix]
+        if prefix == "/policies/expression/" and isinstance(body, dict) and "expression" in body:
+            body = dict(body, expression=body["expression"].strip())  # authentik trims on save
         if method == "POST" and not parts:
             obj = dict(body)
             if idf not in obj or kind != "given":

@@ -971,6 +971,10 @@ def ensure_expression_policy(p: Plan, s: Snapshot, name: str, expression: str, w
                              display: str | None = None):
     """Returns the policy pk or a Ref to the policy created by this plan. `display` is what
     the dry-run prints instead of a very long expression."""
+    # authentik's serializer trims the expression on save (CharField trim_whitespace), so
+    # an untrimmed one never compares equal and the phase never converges (seen live
+    # 2026-10-05: trust applied all 10 changes, then planned the guard again).
+    expression = expression.strip()
     p.text(f"EXPRESSION {name}", expression, display)
     pol = find(s.expr_policies, name=name)
     if pol is None:
@@ -980,7 +984,7 @@ def ensure_expression_policy(p: Plan, s: Snapshot, name: str, expression: str, w
                  {"name": name, "execution_logging": False, "expression": expression},
                  capture={ref.key: "pk"}, inverse=inv("DELETE", ("/policies/expression/", ref, "/"))))
         return ref
-    if pol.get("expression") != expression:
+    if (pol.get("expression") or "").strip() != expression:
         p.add(Op(f"policy.{name}.expr", f"update the expression of policy '{name}' to this "
                  "script's version", "PATCH", ("/policies/expression/", pol["pk"], "/"),
                  {"expression": expression}, before={"expression": pol.get("expression")},
