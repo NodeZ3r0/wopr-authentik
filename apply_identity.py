@@ -59,7 +59,7 @@ ENV_FILE_DEFAULT = "/opt/wopr/control-plane/.env"
 TOKEN_ENV_KEY = "AUTHENTIK_API_TOKEN"
 STATE_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 
-PHASES = ("trust", "antibot", "groups", "yourspace-app", "bink", "lovejoos-gate")
+PHASES = ("trust", "antibot", "groups", "yourspace-app", "bink", "lovejoos-gate", "yourspace-free")
 PHASE_TITLES = {
     "trust": "D0 - one account per email, verified sign-ups",
     "antibot": "WOPR-059 - sign-up abuse defense (throwaway email, per-IP cap, reputation, captcha)",
@@ -67,6 +67,7 @@ PHASE_TITLES = {
     "yourspace-app": "D7 - central OAuth2 client 'yourspace' for beacon sign-in",
     "bink": "BINK - pk 23 becomes bink / BINK, YourSpace member, verified (paid)",
     "lovejoos-gate": "D2 - LoveJoos only for members of lovejoos-users",
+    "yourspace-free": "WOPR-185 - group yourspace-free: has a free account on yourspace.you",
 }
 
 # --- trust (D0) -------------------------------------------------------------
@@ -343,6 +344,12 @@ return True
 GROUP_VERIFIED = "wopr-verified"
 GROUP_YOURSPACE = "yourspace-members"
 GROUP_LOVEJOOS = "lovejoos-users"
+GROUP_YOURSPACE_FREE = "yourspace-free"
+YOURSPACE_FREE_ATTRS = {"wopr": {
+    "meaning": "has a free account on the shared yourspace.you server (no server of their own)",
+    "writer": "control plane only (free sign-up, claim, upgrade) - contract YOURSPACE-FREE",
+    "card": "WOPR-185",
+}}
 GROUP_DUP_SUPER = "WOPR Admins-dup2"
 GROUP_DUP_SUPER_PK = "8b0c316d-229f-4849-8de8-9b0cf7c1a21f"
 VERIFIED_ATTRS = {"wopr": {
@@ -2126,6 +2133,46 @@ def plan_bink(s: Snapshot, o) -> Plan:
     return p
 
 
+def plan_yourspace_free(s: Snapshot, o) -> Plan:
+    """WOPR-185 (contract YOURSPACE-FREE): the group 'yourspace-free'. A plain
+    group: not superuser, no parents, no members, no bindings, and no flow or
+    stage writes it - only the control plane adds people (free sign-up, claim)
+    and removes them (upgrade to their own server)."""
+    p = Plan("yourspace-free")
+    name, attrs = GROUP_YOURSPACE_FREE, YOURSPACE_FREE_ATTRS
+    grp = s.group(name)
+    if grp is None:
+        ref = Ref(f"group.{name}", f"group {name}")
+        p.add(Op(f"group.{name}", f"create group '{name}' (not superuser, no parents, no "
+                 "members, no bindings)", "POST", "/core/groups/",
+                 {"name": name, "is_superuser": False, "parents": [], "users": [],
+                  "roles": [], "attributes": attrs},
+                 capture={ref.key: "pk"}, inverse=inv("DELETE", ("/core/groups/", ref, "/"))))
+        return p
+    changes, before = {}, {}
+    if grp.get("is_superuser"):
+        changes["is_superuser"], before["is_superuser"] = False, True
+    if (grp.get("attributes") or {}).get("wopr") != attrs["wopr"]:
+        changes["attributes"] = {**(grp.get("attributes") or {}), **attrs}
+        before["attributes"] = grp.get("attributes") or {}
+    if changes:
+        p.add(Op(f"group.{name}.fix", f"group '{name}': {', '.join(changes)} back to the "
+                 "intended value", "PATCH", ("/core/groups/", grp["pk"], "/"), changes,
+                 before=before, inverse=inv("PATCH", ("/core/groups/", grp["pk"], "/"), before)))
+    else:
+        p.ok(f"group '{name}' exists (pk {grp['pk']}, {len(grp.get('users') or [])} members)")
+    if grp.get("parents"):
+        p.warn(f"'{name}' has parent group(s); its members inherit them")
+    bound = [b["pk"] for b in s.policy_bindings if b.get("group") == grp["pk"]]
+    if bound:
+        p.warn(f"'{name}' is used in {len(bound)} policy binding(s); YOURSPACE-FREE says none")
+    writers = [st["name"] for st in s.user_write_stages if st.get("create_users_group") == grp["pk"]]
+    if writers:
+        p.block(f"user write stage(s) {', '.join(writers)} put new users into '{name}'; "
+                "only the control plane may write it")
+    return p
+
+
 PLANNERS = {
     "trust": plan_trust,
     "antibot": plan_antibot,
@@ -2133,6 +2180,7 @@ PLANNERS = {
     "yourspace-app": plan_yourspace_app,
     "bink": plan_bink,
     "lovejoos-gate": plan_lovejoos_gate,
+    "yourspace-free": plan_yourspace_free,
 }
 
 
