@@ -468,11 +468,29 @@ class FakeInfisical:
         return self.values[key]
 
 
-def run(argv, api, files=None, infisical=None):
+class FakeDisposable:
+    """The domain-list files in the authentik container (WOPR-189). Installed by default."""
+
+    def __init__(self, installed=True):
+        self.files = {}
+        if installed:
+            text, _, _ = ai.load_disposable()
+            self.files[ai.DISPOSABLE_DEST] = text
+
+    def installed_sha256(self, dest):
+        text = self.files.get(dest)
+        return None if text is None else hashlib.sha256(text.encode("ascii")).hexdigest()
+
+    def install(self, text, dest):
+        self.files[dest] = text
+        return self.installed_sha256(dest)
+
+
+def run(argv, api, files=None, infisical=None, disposable=None):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = ai.main(argv, api=api, files=files or FakeFiles(),
-                     infisical=infisical or FakeInfisical())
+                     infisical=infisical or FakeInfisical(), disposable=disposable or FakeDisposable())
     return rc, buf.getvalue()
 
 
@@ -857,7 +875,8 @@ class ExpressionTests(unittest.TestCase):
             g = {"ip_address": ipaddress.ip_address, "ip_network": ipaddress.ip_network}
             exec(compile(src, "expr", "exec"), g)
             log = types.SimpleNamespace(
-                info=lambda *a, **k: self.__dict__.setdefault("logged", []).append((a, k)))
+                info=lambda *a, **k: self.__dict__.setdefault("logged", []).append((a, k)),
+                warning=lambda *a, **k: self.__dict__.setdefault("logged", []).append((a, k)))
             return g["_f"](request, msgs.append, log, *names.values()), msgs
         finally:
             for k, v in old.items():
@@ -1048,6 +1067,17 @@ class AntibotPlanTests(unittest.TestCase):
         st = next(s for s in self.st["prompt_stages"] if s["name"] == stage_name)
         return [pol.get(x, x) for x in st["validation_policies"]]
 
+    def test_list_file_must_be_installed_first(self):
+        # WOPR-189: the policy reads the list from authentik's custom-templates volume
+        o = ai.build_parser().parse_args([])
+        o.files, o.infisical = self.files, self.infisical
+        o.disposable_files = FakeDisposable(installed=False)
+        plan = ai.plan_antibot(ai.Snapshot(self.api, o), o)
+        self.assertTrue(any("--install-disposable-list" in b for b in plan.blockers()), plan.blockers())
+        o.disposable_files = FakeDisposable(installed=True)
+        plan = ai.plan_antibot(ai.Snapshot(self.api, o), o)
+        self.assertFalse(any("--install-disposable-list" in b for b in plan.blockers()), plan.blockers())
+
     def test_dry_run_today_six_changes_captcha_off(self):
         self.files.texts[SITE] = UNPINNED_SITE  # as on the Rig today
         rc, out = self.run_ab("--dry-run", "--phase", "antibot")
@@ -1092,9 +1122,10 @@ class AntibotPlanTests(unittest.TestCase):
         self.assertEqual(self.names("stage-default-oobe-password"), [])
         self.assertEqual(guard_before, next(p for p in self.st["expr_policies"]
                                             if p["name"] == ai.POLICY_EMAIL_GUARD)["expression"])
-        text, _, _ = ai.load_disposable()
         disp = next(p for p in self.st["expr_policies"] if p["name"] == ai.POLICY_DISPOSABLE)
-        self.assertIn(text, disp["expression"])
+        # WOPR-189: the policy reads the installed list file instead of holding the list
+        self.assertIn(ai.DISPOSABLE_DEST, disp["expression"])
+        self.assertLess(len(disp["expression"]), ai.MAX_EXPRESSION)
         self.assertEqual((self.st["reputation_policies"], self.st["captcha_stages"]), ([], []))
         # undo antibot alone: the guard stays where trust put it
         trust_log, antibot_log = self.logs()
@@ -1357,7 +1388,13 @@ class AntibotExpressionTests(unittest.TestCase):
     # -- wopr-disposable-email
     def test_disposable_email(self):
         text, domains, commit = ai.load_disposable()
-        E, shown = ai.disposable_expression(text, len(domains), commit)
+        tmp = tempfile.mkdtemp()
+        listed, extra = os.path.join(tmp, "disposable_domains.txt"), os.path.join(tmp, "extra.txt")
+        with open(listed, "w", encoding="ascii") as fh:
+            fh.write(text)
+        with open(extra, "w", encoding="ascii") as fh:
+            fh.write("# bot domains seen\nformtests.info\n")
+        E, shown = ai.disposable_expression(text, len(domains), commit, path=listed, extra=extra)
         anon = types.SimpleNamespace(is_authenticated=False, pk=None)
 
         def check(email, user=anon):
@@ -1395,13 +1432,32 @@ class AntibotExpressionTests(unittest.TestCase):
         self.assertFalse(check("new@yopmail.com", FakeUser(61, "me@gmail.com"))[0])
         # authentik's anonymous user is a User row (authenticated, no email): still checked
         self.assertFalse(check("x@mailinator.com", FakeUser(1, ""))[0])
-        # the policy holds the whole list; the printed version does not
-        self.assertIn(text, E)
+        # WOPR-189: the extra bot-domain file counts too
+        self.assertFalse(check("pjrvvvlskr@formtests.info")[0])
+        self.assertFalse(check("x@mail.formtests.info")[0])
+        # WOPR-189: the policy reads the list from the file; it never holds it (a policy that big
+        # hung every sign-up in authentik's result pipe), and it stays far below the pipe buffer
+        self.assertNotIn("mailinator", E)
+        self.assertIn(listed, E)
+        self.assertLess(len(E), ai.MAX_EXPRESSION)
         self.assertIn(ai.DISPOSABLE_COMMIT, E)
         self.assertIn(ai.DISPOSABLE_SHA256, E)
         self.assertIn(DISPOSABLE_MSG, E)
-        self.assertNotIn("mailinator", shown)
         self.assertIn("9205 domains", shown)
+        # a missing list file lets the address through (and logs), so nobody is locked out
+        gone, _ = ai.disposable_expression(text, len(domains), commit, path=os.path.join(tmp, "nope"),
+                                           extra=os.path.join(tmp, "nope2"))
+        ok, msgs = self.run_expr(gone, types.SimpleNamespace(
+            user=anon, context={"prompt_data": {"email": "bot@mailinator.com"}}))
+        self.assertTrue(ok)
+        self.assertEqual(msgs, [])
+        # the extra file is optional
+        no_extra, _ = ai.disposable_expression(text, len(domains), commit, path=listed,
+                                               extra=os.path.join(tmp, "nope2"))
+        self.assertFalse(self.run_expr(no_extra, types.SimpleNamespace(
+            user=anon, context={"prompt_data": {"email": "bot@mailinator.com"}}))[0])
+        self.assertTrue(self.run_expr(no_extra, types.SimpleNamespace(
+            user=anon, context={"prompt_data": {"email": "x@formtests.info"}}))[0])
 
     # -- wopr-signup-ip-limit
     def ip_limit(self, client, rows, relay=False):
@@ -1541,17 +1597,28 @@ class AntibotExpressionTests(unittest.TestCase):
             self.assertTrue(ok, inside)
             self.assertEqual(calls, [], inside)
 
+    def test_install_disposable_list(self):
+        fake = FakeDisposable(installed=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ai.install_disposable_list(fake)
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(fake.installed_sha256(ai.DISPOSABLE_DEST), ai.DISPOSABLE_SHA256)
+        self.assertIn("matches the pinned list", buf.getvalue())
+        if os.path.exists(ai.EXTRA_BLOCKED_FILE):
+            self.assertIn("formtests.info", fake.files[ai.EXTRA_BLOCKED_DEST])
+
     def test_expressions_compile_the_way_authentik_runs_them(self):
         text, domains, commit = ai.load_disposable()
         big, _ = ai.disposable_expression(text, len(domains), commit)
-        self.assertLess(len(big), 200_000)
         ctx = "ak_message,ak_user_has_authenticator,ak_is_sso_flow,ak_client_ip,http_request," \
               "request,context"
         for name, expr in ((ai.POLICY_DISPOSABLE, big), (ai.POLICY_RELAY, ai.RELAY_EXPR),
                            (ai.POLICY_SIGNUP_IP, ai.SIGNUP_IP_EXPR),
                            (ai.POLICY_REPUTATION_GATE, ai.REPUTATION_GATE_EXPR)):
-            # authentik's BaseEvaluator.wrap_expression: indent() also indents the lines of
-            # the domain list inside its string; the policy splits on whitespace for that.
+            # WOPR-189: authentik pipes every policy result back with the policy in it; a policy
+            # over the 64 KB pipe buffer hangs the flow forever. Keep all of them small.
+            self.assertLess(len(expr), ai.MAX_EXPRESSION, name)
             wrapped = (f"def handler({ctx}):\n" + textwrap.indent(expr, "    ")
                        + f"\nresult = handler({ctx})")
             t0 = time.perf_counter()

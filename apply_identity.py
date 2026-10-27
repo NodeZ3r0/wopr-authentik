@@ -167,11 +167,22 @@ return False
 
 # --- antibot (WOPR-059) -----------------------------------------------------
 # The disposable-email list is vendored byte for byte (the same file in every WOPR app,
-# contract ABUSE-DEFENSE) and embedded in the policy. authentik keeps policies in its
-# database, so the list travels with it (backups, restores, rollback of this script) and
-# needs no file mounted into the authentik containers.
+# contract ABUSE-DEFENSE). It used to be embedded in the policy; since WOPR-189 it is a
+# file in authentik's custom-templates volume (server and worker both mount it at
+# /templates) that the policy reads. Why: authentik runs a flow's policies in-process and
+# hands each result back through a multiprocessing Pipe that is read only after the policy
+# ran; the result carries the binding and so the policy, and a 130 KB expression is bigger
+# than the pipe buffer (64 KB), so send() blocked forever and every sign-up hung (LoveJoos
+# saw 502 after 20 s; no self-registration completed from 2026-10-05 to 2026-10-27).
+# Keep every expression well under that: see MAX_EXPRESSION.
 ABUSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "abuse")
 DISPOSABLE_FILE = os.path.join(ABUSE_DIR, "disposable_domains.txt")
+EXTRA_BLOCKED_FILE = os.path.join(ABUSE_DIR, "extra_blocked_domains.txt")
+AUTHENTIK_CONTAINER = "authentik-server-1"
+DISPOSABLE_DEST_DIR = "/templates/wopr"
+DISPOSABLE_DEST = DISPOSABLE_DEST_DIR + "/disposable_domains.txt"
+EXTRA_BLOCKED_DEST = DISPOSABLE_DEST_DIR + "/extra_blocked_domains.txt"
+MAX_EXPRESSION = 16_000
 DISPOSABLE_COMMIT_FILE = os.path.join(ABUSE_DIR, "SOURCE_COMMIT")
 DISPOSABLE_SHA256 = "a1390dd93de132a45d6ffd598375310531da5358805659df4113f0584f663ef4"
 DISPOSABLE_COMMIT = "1aac72a07cd89792016dd5d2056bc418d85b8f14"
@@ -209,13 +220,16 @@ DISPOSABLE_EXPR_TEMPLATE = '''\
 # wopr-disposable-email (WOPR-059) - managed by fixwave/authentik/apply_identity.py
 # Validation policy on every prompt stage that writes "email", next to wopr-email-guard.
 # Refuses a NEW address whose domain, or any parent domain, is a throwaway-inbox domain.
-# The list below is the disposable-email-domains project's, commit @COMMIT@
-# (@COUNT@ domains, sha256 @SHA256@),
-# the same vendored file every WOPR app uses (fixwave/authentik/abuse/disposable_domains.txt).
+# The list is the disposable-email-domains project's, commit @COMMIT@
+# (@COUNT@ domains, sha256 @SHA256@), the same vendored file every WOPR app uses
+# (fixwave/authentik/abuse/disposable_domains.txt), installed by
+# apply_identity.py --install-disposable-list at @PATH@ (authentik's custom-templates
+# volume), plus the bot domains WOPR has seen at @EXTRA@ (optional).
+# It is not embedded here (WOPR-189): a policy this big hung every sign-up (authentik pipes
+# each result back with the policy in it). If the list file is missing the address is let
+# through and a warning is logged, so a lost file never locks people out.
 # An address the signed-in user already has is never refused here, so nobody is locked
 # out of the onboarding or settings form over an old address.
-# The list lives inside this policy because authentik keeps policies in its database: no
-# file in the authentik containers is needed. The check itself is after the list.
 prompt_data = request.context.get("prompt_data") or {}
 email = str(prompt_data.get("email") or "").strip().lower()
 if "@" not in email:
@@ -229,9 +243,18 @@ try:
     domain = domain.encode("idna").decode("ascii")
 except UnicodeError:
     pass
-DOMAINS = """
-@DOMAINS@"""
-blocked = frozenset(DOMAINS.split())
+try:
+    with open("@PATH@", encoding="ascii") as fh:
+        blocked = set(fh.read().split())
+except OSError as exc:
+    ak_logger.warning("wopr-disposable-email: domain list missing, address not checked",
+                      path="@PATH@", error=str(exc))
+    return True
+try:
+    with open("@EXTRA@", encoding="ascii") as fh:
+        blocked.update(x for x in fh.read().split() if not x.startswith("#"))
+except OSError:
+    pass
 labels = [x for x in domain.split(".") if x]
 if any(".".join(labels[i:]) in blocked for i in range(len(labels))):
     ak_message("Please use a permanent email address; throwaway inboxes can't be used here.")
@@ -1276,14 +1299,53 @@ def load_disposable(path: str | None = None, commit_path: str | None = None):
     return text, domains, commit
 
 
-def disposable_expression(text: str, count: int, commit: str) -> tuple[str, str]:
-    """(the policy expression, the same with the domain list left out for printing)."""
-    head = (DISPOSABLE_EXPR_TEMPLATE.replace("@COMMIT@", commit).replace("@COUNT@", str(count))
-            .replace("@SHA256@", DISPOSABLE_SHA256))
-    expr = head.replace("@DOMAINS@", text, 1)
-    shown = head.replace("@DOMAINS@", f"<{count} domains from abuse/disposable_domains.txt "
-                         f"(sha256 {DISPOSABLE_SHA256[:16]}...), not printed>\n", 1)
-    return expr, shown
+def disposable_expression(text: str, count: int, commit: str, path: str = DISPOSABLE_DEST,
+                          extra: str = EXTRA_BLOCKED_DEST) -> tuple[str, str]:
+    """(the policy expression, the same for printing). The list itself is not in it any more
+    (WOPR-189); `text` stays a parameter so callers keep checking the vendored file first."""
+    expr = (DISPOSABLE_EXPR_TEMPLATE.replace("@COMMIT@", commit).replace("@COUNT@", str(count))
+            .replace("@SHA256@", DISPOSABLE_SHA256).replace("@PATH@", path).replace("@EXTRA@", extra))
+    return expr, expr
+
+
+class DisposableFiles:
+    """The domain-list files inside the authentik containers (WOPR-189). The custom-templates
+    volume is shared by server and worker, so writing through the server container is enough."""
+
+    def __init__(self, container: str = AUTHENTIK_CONTAINER):
+        self.container = container
+
+    def installed_sha256(self, dest: str) -> str | None:
+        proc = subprocess.run(["docker", "exec", self.container, "sha256sum", dest],
+                              capture_output=True, text=True, check=False)
+        return proc.stdout.split()[0] if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def install(self, text: str, dest: str) -> str | None:
+        proc = subprocess.run(["docker", "exec", "-i", self.container, "sh", "-c",
+                               f"mkdir -p {DISPOSABLE_DEST_DIR} && cat > {dest}.tmp && mv {dest}.tmp {dest}"],
+                              input=text, text=True, capture_output=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"could not write {dest} in {self.container}: {proc.stderr.strip()[:300]}")
+        return self.installed_sha256(dest)
+
+
+def install_disposable_list(files) -> int:
+    """--install-disposable-list: put the vendored list (and the extra bot domains, if the file
+    exists) into authentik's custom-templates volume, then check the sha256 of what landed."""
+    text, domains, commit = load_disposable()
+    got = files.install(text, DISPOSABLE_DEST)
+    ok = got == DISPOSABLE_SHA256
+    print(f"{DISPOSABLE_DEST}: {len(domains)} domains, commit {commit[:12]}, sha256 "
+          f"{(got or '?')[:16]}... {'matches the pinned list' if ok else 'DOES NOT MATCH'}")
+    if os.path.exists(EXTRA_BLOCKED_FILE):
+        with open(EXTRA_BLOCKED_FILE, encoding="ascii") as fh:
+            extra = fh.read()
+        want = hashlib.sha256(extra.encode("ascii")).hexdigest()
+        got_extra = files.install(extra, EXTRA_BLOCKED_DEST)
+        ok = ok and got_extra == want
+        print(f"{EXTRA_BLOCKED_DEST}: {sum(1 for x in extra.split() if not x.startswith('#'))} "
+              f"extra domains, {'installed' if got_extra == want else 'DOES NOT MATCH'}")
+    return 0 if ok else 1
 
 
 def is_disposable(email: str, blocked) -> bool:
@@ -1534,8 +1596,20 @@ def plan_antibot(s: Snapshot, o) -> Plan:
     else:
         expr, shown = disposable_expression(text, len(domains), commit)
         p.info(f"disposable-email list: {len(domains)} domains (disposable-email-domains commit "
-               f"{commit[:12]}, sha256 {DISPOSABLE_SHA256[:16]}..., pinned), embedded in the "
-               f"policy: {len(expr)} characters")
+               f"{commit[:12]}, sha256 {DISPOSABLE_SHA256[:16]}..., pinned), read by the policy "
+               f"from {DISPOSABLE_DEST} in {AUTHENTIK_CONTAINER}; policy {len(expr)} characters")
+        files = getattr(o, "disposable_files", None)
+        if files is not None:
+            got = files.installed_sha256(DISPOSABLE_DEST)
+            if got != DISPOSABLE_SHA256:
+                p.block(f"{DISPOSABLE_DEST} in {AUTHENTIK_CONTAINER} is "
+                        f"{'missing' if got is None else 'not the pinned list'}: run "
+                        "./apply_identity.py --install-disposable-list first")
+            else:
+                p.ok(f"{DISPOSABLE_DEST} in {AUTHENTIK_CONTAINER} is the pinned list")
+        if len(expr) > MAX_EXPRESSION:
+            p.block(f"policy {POLICY_DISPOSABLE} would be {len(expr)} characters; authentik hangs "
+                    f"on policies over the pipe buffer, keep it under {MAX_EXPRESSION}")
         disposable = ensure_expression_policy(
             p, s, POLICY_DISPOSABLE, expr, "refuses a new address on a throwaway-inbox domain or "
             "a subdomain of one", display=shown)
@@ -2531,6 +2605,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--apply", choices=PHASES, metavar="PHASE",
                     help="apply ONE phase: " + ", ".join(PHASES))
     ap.add_argument("--rollback", metavar="LOG", help="undo a logged apply (state/*.json)")
+    ap.add_argument("--install-disposable-list", action="store_true",
+                    help="put abuse/disposable_domains.txt (+ extra_blocked_domains.txt) into "
+                         "authentik's custom-templates volume, where wopr-disposable-email reads it")
     ap.add_argument("--check-schema", action="store_true",
                     help="read-only: check every endpoint, request field and enum this script "
                          "uses against the live /api/v3/schema/")
@@ -2570,8 +2647,11 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv=None, api=None, files=None, infisical=None) -> int:
+def main(argv=None, api=None, files=None, infisical=None, disposable=None) -> int:
     args = build_parser().parse_args(argv)
+    args.disposable_files = disposable or DisposableFiles()
+    if args.install_disposable_list:
+        return install_disposable_list(args.disposable_files)
     if args.apply and args.dry_run:
         print("--apply and --dry-run exclude each other", file=sys.stderr)
         return 2

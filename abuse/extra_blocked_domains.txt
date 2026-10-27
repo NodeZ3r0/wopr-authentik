@@ -1,0 +1,22 @@
+# Bot sign-up domains seen on WOPR sites that the vendored disposable list does not have (WOPR-189).
+# One domain per line; a listed domain also blocks its subdomains. core/signup.py reads this file.
+# barterra.store form-filler bots
+formtests.info
+immenseignite.info
+# social.wopr.systems casino and link-spam sign-ups, 2026-07 to 2026-10
+alelvisoftware.com
+assi-ti.ch
+base-jump.at
+bistumsarchiv-chur.ch
+coinvaluehub.cash
+fluglaermhalleost.de
+gertpolli.com
+hobl-gmbh.at
+iwhisky.cz
+jirinajiraskova.cz
+mail.grokbot.com
+raads-rtest.online
+thun-west.ch
+trypulsegrid.co
+ukraina.at
+usepulsegrid.co
