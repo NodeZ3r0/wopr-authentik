@@ -443,7 +443,7 @@ return True
 
 # --- bink -------------------------------------------------------------------
 BINK_PK = 23
-BINK_EMAIL = "sbinkerd1@gmail.com"
+BINK_EMAIL = "bink@binkerd.us"
 BINK_USERNAME = "bink"
 BINK_NAME = "BINK"
 BINK_YOURSPACE = {"handle": "bink", "domain": "bink.yourspace.you"}

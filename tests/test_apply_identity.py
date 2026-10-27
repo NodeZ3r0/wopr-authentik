@@ -149,7 +149,7 @@ def fixture():
             {"pk": 22, "username": "Thedude", "name": "Bink", "email": "dude@example.org",
              "type": "external", "path": "users", "is_active": True, "groups": [], "roles": [],
              "attributes": {}, "uid": "u22"},
-            {"pk": 23, "username": "Sbinkerd1", "name": "Scott", "email": "sbinkerd1@gmail.com",
+            {"pk": 23, "username": "Sbinkerd1", "name": "Scott", "email": "bink@binkerd.us",
              "type": "external", "path": "users", "is_active": True, "groups": [], "roles": [],
              "attributes": {"access_code": "kept-secret-ish"},
              "uid": "cf778cafddfb365660ffe718aa9061f34932b9472d0f09a891873fd8e857969f"},
@@ -606,7 +606,7 @@ class ApplyTests(unittest.TestCase):
         self.emails = os.path.join(self.tmp, "lj.txt")
         with open(self.emails, "w") as fh:
             fh.write("# LoveJoos users with a central login\nljfan@example.org\n"
-                     "nobody@example.org\nsbinkerd1@gmail.com\n")
+                     "nobody@example.org\nbink@binkerd.us\n")
 
     def apply(self, phase, *extra):
         return run(["--apply", phase, "--state-dir", self.tmp, *extra], self.api, self.files,
@@ -894,7 +894,7 @@ class ExpressionTests(unittest.TestCase):
 
     def test_email_guard(self):
         anon = types.SimpleNamespace(is_authenticated=False, pk=None)
-        bink = FakeUser(23, "sbinkerd1@gmail.com")
+        bink = FakeUser(23, "bink@binkerd.us")
         other = FakeUser(40, "ljfan@example.org")
         users = [bink, other]
         E = ai.EMAIL_GUARD_EXPR
@@ -902,14 +902,14 @@ class ExpressionTests(unittest.TestCase):
         ok, msgs = self.run_expr(E, self.req(anon, " SBINKERD1@gmail.com "), users)
         self.assertFalse(ok)
         self.assertIn("already used by another account", msgs[0])
-        self.assertTrue(self.run_expr(E, self.req(bink, "sbinkerd1@gmail.com"), users)[0])
+        self.assertTrue(self.run_expr(E, self.req(bink, "bink@binkerd.us"), users)[0])
         self.assertTrue(self.run_expr(E, self.req(bink, "SBinkerd1@Gmail.com"), users)[0])
         self.assertFalse(self.run_expr(E, self.req(bink, "ljfan@example.org"), users)[0])
         ok, msgs = self.run_expr(E, self.req(bink, "fresh@example.org"), users)
         self.assertFalse(ok)
         self.assertIn("can't be changed", msgs[0])
         self.assertTrue(self.run_expr(E, self.req(bink, "fresh@example.org", True), users)[0])
-        allowed = FakeUser(23, "sbinkerd1@gmail.com", can_change=True)
+        allowed = FakeUser(23, "bink@binkerd.us", can_change=True)
         self.assertTrue(self.run_expr(E, self.req(allowed, "fresh@example.org"), [allowed])[0])
         no_http = types.SimpleNamespace(user=bink, context={"prompt_data": {"email": "x@y.org"}},
                                         http_request=None)
