@@ -899,11 +899,11 @@ class ExpressionTests(unittest.TestCase):
         users = [bink, other]
         E = ai.EMAIL_GUARD_EXPR
         self.assertEqual(self.run_expr(E, self.req(anon, "new@example.org"), users)[0], True)
-        ok, msgs = self.run_expr(E, self.req(anon, " SBINKERD1@gmail.com "), users)
+        ok, msgs = self.run_expr(E, self.req(anon, " Bink@Binkerd.US "), users)
         self.assertFalse(ok)
         self.assertIn("already used by another account", msgs[0])
         self.assertTrue(self.run_expr(E, self.req(bink, "bink@binkerd.us"), users)[0])
-        self.assertTrue(self.run_expr(E, self.req(bink, "SBinkerd1@Gmail.com"), users)[0])
+        self.assertTrue(self.run_expr(E, self.req(bink, "Bink@Binkerd.US"), users)[0])
         self.assertFalse(self.run_expr(E, self.req(bink, "ljfan@example.org"), users)[0])
         ok, msgs = self.run_expr(E, self.req(bink, "fresh@example.org"), users)
         self.assertFalse(ok)
