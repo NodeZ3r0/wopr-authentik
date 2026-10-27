@@ -83,7 +83,9 @@ ABANDONED_AFTER_HOURS = 25
 EMAIL_GUARD_NOTE = ("the email guard frees an address only from an abandoned, never-confirmed "
                     "sign-up on that path")
 EMAIL_STAGE = "self-registration-email-verification"
-EMAIL_TEMPLATE = "email/account_confirmation.html"
+# WOPR's own confirmation email (custom-templates volume /templates/wopr/), never authentik's stock one with
+# its logo (Scott 2026-10-27: users never see the authentik name).
+EMAIL_TEMPLATE = "wopr/email-account-confirmation.html"
 EMAIL_STAGE_ATTRS = {
     "use_global_settings": True,
     "template": EMAIL_TEMPLATE,
